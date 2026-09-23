@@ -14,6 +14,7 @@ import sys
 import threading
 import time
 import uuid
+from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
@@ -22,6 +23,7 @@ import pandas as pd
 
 import graph_agent
 from validate import validate
+from provenance import verify_manifest
 
 ROOT = Path(__file__).resolve().parent
 FILES = ('nodes.parquet','edges.parquet','transactions.parquet')
@@ -47,6 +49,9 @@ def read_csv(path):
 class Snapshot:
     def __init__(self, data, out, version, label):
         self.data,self.out,self.version = Path(data),Path(out),version
+        self.manifest=verify_manifest(self.data,self.out)
+        self.analysis=json.loads((self.out/'analysis.json').read_text(encoding='utf-8'))
+        self.downloads={name:(self.out/name).read_bytes() for name in ('nodes_roles.csv','clusters.csv','top_nodes.csv')}
         numeric_int = {'cluster_id','depth','in_deg','out_deg','in_tx','out_tx','upstream_seed_count','reciprocal_deg','cross_cluster_count'}
         bool_cols = {'is_seed','truncated_by_depth','in_cycle','is_articulation'}
         self.nodes=[]
@@ -77,6 +82,16 @@ class Snapshot:
         self.top=read_csv(self.out/'top_nodes.csv')
         self.tx=pd.read_parquet(self.data/'transactions.parquet')
         self.tx['date']=pd.to_datetime(self.tx['date']).dt.strftime('%Y-%m-%d')
+        self.edge_by_pair={(e['from'],e['to']):e for e in self.edges}
+        self.paths={c['gid']:[c['gid']] for c in sorted(self.nodes,key=lambda c:int(c['gid'])) if c['is_seed']}
+        queue=deque(self.paths)
+        while queue:
+            source=queue.popleft()
+            if len(self.paths[source])>4: continue
+            for target in sorted(self.graph.successors(source),key=int):
+                if target not in self.paths:
+                    self.paths[target]=self.paths[source]+[target]
+                    queue.append(target)
         self.meta={'label':label,'nodes':len(self.nodes),'edges':len(self.edges),'transactions':len(self.tx),
             'seeds':sum(c['is_seed'] for c in self.nodes),'truncated':sum(c['truncated'] for c in self.nodes),
             'volume_kzt':float(edges.sum_kzt.sum()),'date_from':None if self.tx.empty else str(self.tx.date.min()),
@@ -84,7 +99,14 @@ class Snapshot:
             'minimum_observed_kzt':None if self.tx.empty else float(self.tx.sum_kzt.min()),
             'max_depth':max(c['depth'] for c in self.nodes)}
         self.payload=json.dumps({'version':version,'meta':self.meta,'nodes':self.nodes,'edges':self.edges,
-            'clusters':self.clusters,'top':self.top},ensure_ascii=False,allow_nan=False).encode()
+            'clusters':self.clusters,'top':self.top,'audit':{'stability':self.analysis['stability'],
+            'elapsed_seconds':self.manifest['elapsed_seconds']}},ensure_ascii=False,allow_nan=False).encode()
+
+    def seed_path(self,gid):
+        nodes=self.paths.get(gid,[])
+        return {'nodes':nodes,'edges':[self.edge_by_pair[(a,b)] for a,b in zip(nodes,nodes[1:])],
+            'note':'Один кратчайший направленный путь от seed, до 4 переходов. Суммы — за весь период; непрерывное движение одних и тех же денег не установлено.' if nodes else
+                   'Направленный путь от seed в пределах 4 переходов не найден в наблюдаемых данных.'}
 
     def neighbors(self,gid,direction='both'):
         return sorted((e for e in self.adjacency[gid] if direction=='both' or
@@ -221,11 +243,12 @@ class Handler(BaseHTTPRequestHandler):
                     version=parse_qs(url.query).get('version',[snap.version])[0]
                     if version!=snap.version: return self.send_data(409,{'error':'Датасет изменился; обновите страницу'})
                     if gid not in snap.by_id: return self.send_data(404,{'error':'GID не найден'})
-                    return self.send_data(200,{'version':snap.version,'client':snap.by_id[gid],'neighbors':snap.neighbors(gid),'daily':snap.daily(gid)})
+                    return self.send_data(200,{'version':snap.version,'client':snap.by_id[gid],'neighbors':snap.neighbors(gid),'daily':snap.daily(gid),
+                        'analysis':snap.analysis['nodes'][gid],'seed_path':snap.seed_path(gid)})
                 if path.startswith('/out/') and path[5:] in {'nodes_roles.csv','clusters.csv','top_nodes.csv'}:
                     version=parse_qs(url.query).get('version',[snap.version])[0]
                     if version!=snap.version: return self.send_data(409,{'error':'Экспорт устарел; обновите данные'})
-                    return self.send_data(200,(snap.out/path[5:]).read_bytes(),'text/csv; charset=utf-8',path[5:])
+                    return self.send_data(200,snap.downloads[path[5:]],'text/csv; charset=utf-8',path[5:])
                 static={'/':'index.html','/ui':'index.html','/ui/':'index.html',
                         '/ui/index.html':'index.html','/ui/app.js':'app.js','/ui/style.css':'style.css',
                         '/ui/workspace.css':'workspace.css'}
@@ -262,12 +285,17 @@ class Handler(BaseHTTPRequestHandler):
 def main():
     parser=argparse.ArgumentParser()
     parser.add_argument('--port',type=int,default=8000)
+    parser.add_argument('--use-prebuilt',action='store_true',help='Проверить и использовать готовую папку out без повторного расчёта')
     args=parser.parse_args()
     runtime=ROOT/'.runtime'
-    demo_out=runtime/'demo'/'out'
-    compile_dataset(ROOT/'data',demo_out)
+    demo_out=ROOT/'out'
+    if args.use_prebuilt:
+        verify_manifest(ROOT/'data',demo_out)
+        validate(ROOT/'data',demo_out)
+    else:
+        compile_dataset(ROOT/'data',demo_out)
     fingerprint=hashlib.sha256()
-    for file in [demo_out/'nodes_roles.csv',ROOT/'data'/'edges.parquet',ROOT/'data'/'transactions.parquet']:
+    for file in [demo_out/'nodes_roles.csv',demo_out/'analysis.json',ROOT/'data'/'edges.parquet',ROOT/'data'/'transactions.parquet']:
         fingerprint.update(file.read_bytes())
     demo=Snapshot(ROOT/'data',demo_out,'demo-'+fingerprint.hexdigest()[:12],'Исходный датасет · HackAlem')
     store=Store(runtime,demo)

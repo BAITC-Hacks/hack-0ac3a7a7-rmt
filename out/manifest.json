@@ -1,0 +1,21 @@
+{
+  "inputs": {
+    "nodes.parquet": "d2a45b0df6e9352832d5fb09839d10b9e23f898156c3bab263b051b31cc0296d",
+    "edges.parquet": "4e71dde5cd3115bcb26e91202665532ee6581cf8233a9fc8059ea59fb7358a38",
+    "transactions.parquet": "c30c5317b5439591dde86f2058dc47a3d19b2900c055ded994fe547f6fb7e7da"
+  },
+  "outputs": {
+    "nodes_roles.csv": "ed81f54fa0e457378519fa5f48fb740773a96cedefb6f6a835afcc80b8c99446",
+    "clusters.csv": "462dc6f30454b245766ca27cfbc1c51e73260280788857b554ac4eff9c7e2089",
+    "top_nodes.csv": "a6a1a7057322e19b85c183eaeee441e281aaf789bc61ddb8546649ea3c2ae12a",
+    "analysis.json": "5e8a3c2bcf1ad90893bacd11efa0670ca7db67596d934b5d662b49dc7268e93f"
+  },
+  "sources": {
+    "starter.py": "1e2be054eeaf22762b31baef86edc982eb1845c96c440d0ef32ced7d861914b3",
+    "role_model.py": "3cc16a44cd4bc2e9b390e2c8e1060d3dde2f4354ebca7827f8276ead65ae2afc",
+    "analysis_report.py": "3f8b5b8e4b9ecf41f94c01283fe1642140b885fdc97e76653d92359a24d7d4cf",
+    "provenance.py": "a170a373b2b147bc6102d92c4b23b0e3acae461e50b47d637633186cb3cc77f0"
+  },
+  "elapsed_seconds": 3.091,
+  "schema_version": 1
+}

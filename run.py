@@ -20,7 +20,7 @@ def main() -> None:
     args=parser.parse_args()
     if not args.skip_install:
         subprocess.run(
-            [sys.executable, "-m", "pip", "install", "-r", str(ROOT / "requirements.txt")],
+            [sys.executable, "-m", "pip", "install", "-r", str(ROOT / "requirements.lock.txt")],
             check=True,
         )
     subprocess.run(
@@ -36,7 +36,7 @@ def main() -> None:
     )
     subprocess.run([sys.executable, str(ROOT / "validate.py")], check=True)
     if args.serve:
-        subprocess.run([sys.executable,str(ROOT/'server.py'),'--port',str(args.port)],check=True)
+        subprocess.run([sys.executable,str(ROOT/'server.py'),'--use-prebuilt','--port',str(args.port)],check=True)
 
 
 if __name__ == "__main__":

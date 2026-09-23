@@ -61,6 +61,12 @@
             <button id="showConnections" class="button primary">Показать связи клиента<span data-icon="arrowright"></span></button>
           </aside>
         </div>
+        <section class="analysis-panel" aria-labelledby="analysisTitle">
+          <div class="analysis-heading"><div><span class="eyebrow">ПРОВЕРЯЕМЫЙ РАЗБОР</span><h2 id="analysisTitle">Почему этот клиент?</h2><p id="analysisClient">Выберите узел на карте</p></div><button class="button" id="showSeedPath">Путь от seed →</button></div>
+          <div class="analysis-tabs" role="tablist" aria-label="Основания анализа"><button role="tab" aria-selected="true" data-analysis-tab="role">01 · Роль и признаки</button><button role="tab" aria-selected="false" data-analysis-tab="time">02 · Движение по дням</button><button role="tab" aria-selected="false" data-analysis-tab="path">03 · Цепочка переводов</button></div>
+          <div id="analysisContent" class="analysis-content" aria-live="polite">Загрузка оснований…</div>
+          <div id="auditSummary" class="audit-summary"></div>
+        </section>
         <button class="assistant-strip" data-view="assistant"><span class="assistant-orb" data-icon="spark"></span><span><strong>От связей к объяснению</strong><span id="agentBrief">Разберите роль клиента и проследите движение денег.</span></span><span class="agent-status" id="agentStatus">Подключение</span><span class="assistant-cta">Спросить ассистента <span data-icon="arrowright"></span></span></button>
         <details id="nodeDetails" class="node-details"><summary>Все переводы и активные дни выбранного клиента</summary><div class="details-content"><p id="detailSummary">—</p><div id="detailTable" class="table-wrap"></div><div class="pagination"><button class="button" id="detailPrevious">← Назад</button><span id="detailPageLabel"></span><button class="button" id="detailNext">Далее →</button></div><h3>Активность по дням</h3><p>Суммы в пределах выборки. Порядок операций внутри дня неизвестен.</p><div id="dailyTable" class="table-wrap daily-table"></div></div></details>
         <div class="queue-heading"><div><h2>С чего начать проверку <span class="count-pill">TOP 5</span></h2><p>Клиенты с наибольшим приоритетом в транзакционной сети</p></div><button class="text-button" data-view="queue">Все клиенты<span data-icon="arrowright"></span></button></div><div id="previewTable" class="table-wrap"></div>

@@ -154,6 +154,10 @@ def execute(snapshot, plan):
                       f"отправлено {money(c['out_kzt'])}; получателей: {c['out_deg']}, операций: {c['out_tx']}. "
                       f"Основание: {c['evidence']} Приоритет {c['priority_score']*100:.1f}/100, "
                       f"эвристическая сила роли {c['role_score']:.3f}, не калиброванная вероятность.")
+            detail=snapshot.analysis['nodes'][c['gid']]
+            answer += (f" Альтернативная роль: {LABELS[detail['runner_up']]} ({detail['runner_score']:.3f}). "
+                       f"При изменении весов приоритета на ±20% место: {detail['stability']['rank_min']}–{detail['stability']['rank_max']}. "
+                       'Это чувствительность рейтинга, не проверка точности роли.')
         elif action == 'cluster':
             cluster = next(item for item in snapshot.clusters if item['cluster_id'] == c['cluster_id'])
             answer = (f"Кластер #{cluster['cluster_id']}: {cluster['n_nodes']} клиентов, {cluster['n_seed']} seed; "
@@ -166,6 +170,8 @@ def execute(snapshot, plan):
             ranked = sorted(days,key=lambda day:day['incoming']+day['outgoing'],reverse=True)[:limit]
             answer += '\n' + '\n'.join(f"{day['date']}: вход {money(day['incoming'])}, выход {money(day['outgoing'])}, {day['n_tx']} операций." for day in ranked)
             answer += '\nПоказаны самые активные дни. Данные содержат даты без времени: порядок переводов в один день неизвестен.'
+            lag=snapshot.analysis['nodes'][c['gid']]['temporal']
+            answer += f"\nОкно 1–2 дня: сопоставлено {money(lag['matched_kzt'])}, {lag['ratio']:.1%} наблюдаемого входа. {lag['method']}"
         elif action == 'neighbors':
             neighbors = snapshot.neighbors(c['gid'],plan['direction'])
             answer = f"Клиент {c['gid']}: связей в направлении «{plan['direction']}» — {len(neighbors)}. Первые {min(limit,len(neighbors))} по сумме:\n"

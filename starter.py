@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import time
 from collections import Counter
 from pathlib import Path
 
@@ -17,6 +18,9 @@ import networkx as nx
 import numpy as np
 import pandas as pd
 import pyarrow.parquet as pq
+from role_model import role_model, priority_features, PRIORITY_WEIGHTS
+from analysis_report import export_analysis
+from provenance import write_manifest
 
 ROLES = ["consolidator", "transit", "distributor", "terminal", "coordinator", "peripheral"]
 ROLE_RISK = {"coordinator": 1.0, "consolidator": .92, "distributor": .86,
@@ -249,35 +253,7 @@ def score_roles(frame):
              "betweenness", "upstream_seed_count", "cross_cluster_count", "active_days"]
     for column in pcols:
         frame[column + "_pct"] = percentile(frame[column])
-    low_activity = 1 - np.maximum(frame.in_tx_pct, frame.out_tx_pct)
-    has_in, has_out = (frame.in_deg > 0).astype(float), (frame.out_deg > 0).astype(float)
-    both = has_in * has_out
-    scores = pd.DataFrame(index=frame.index)
-    scores["consolidator"] = (
-        .29*frame.in_deg_pct + .20*frame.in_kzt_pct + .16*frame.in_tx_pct +
-        .12*(1-frame.out_deg_pct) + .13*frame.upstream_seed_count_pct + .10*frame.pagerank_pct
-    ) * ((frame.in_deg >= 3) & ~frame.is_seed)
-    scores["distributor"] = (
-        .31*frame.out_deg_pct + .22*frame.out_kzt_pct + .17*frame.out_tx_pct +
-        .10*(1-frame.out_concentration) + .10*frame.betweenness_pct + .10*frame.upstream_seed_count_pct
-    ) * (frame.out_deg >= 3)
-    scores["transit"] = (
-        .30*frame.same_day_ratio + .24*frame.flow_balance +
-        .15*frame.both_direction_days.clip(upper=3)/3 + .13*frame.betweenness_pct +
-        .10*frame.active_days_pct + .08*(1-np.abs(frame.in_deg_pct-frame.out_deg_pct))
-    ) * both * (~frame.is_seed)
-    observed = (frame.out_deg == 0) & (frame.in_deg > 0) & ~frame.truncated_by_depth
-    censored = frame.truncated_by_depth & (frame.in_deg > 0)
-    materiality = .38*frame.in_kzt_pct + .28*frame.in_tx_pct + .20*frame.in_deg_pct + .14*frame.active_days_pct
-    scores["terminal"] = np.where(observed, .48+.52*materiality,
-                                  np.where(censored, .20+.45*materiality, 0.))
-    scores["coordinator"] = (
-        .27*frame.betweenness_pct + .23*frame.upstream_seed_count_pct +
-        .18*frame.cross_cluster_count_pct + .12*frame.pagerank_pct +
-        .10*frame.in_deg_pct + .10*frame.out_deg_pct + .08*frame.is_articulation.astype(float)
-    ).clip(upper=1.) * both * (
-        (frame.upstream_seed_count >= 2) | frame.is_articulation | (frame.cross_cluster_count >= 2))
-    scores["peripheral"] = (.30 + .55*low_activity + .15*(frame.in_deg+frame.out_deg <= 1)).clip(upper=1.)
+    scores, _, _ = role_model(frame)
     for role in ROLES:
         frame["score_" + role] = scores[role].fillna(0.).clip(0., 1.)
     role_columns = ["score_" + role for role in ROLES]
@@ -286,12 +262,8 @@ def score_roles(frame):
     isolates = (frame.in_deg == 0) & (frame.out_deg == 0)
     frame.loc[isolates, ["role", "role_score"]] = ["peripheral", 1.]
 
-    activity = np.maximum.reduce([frame.in_kzt_pct, frame.out_kzt_pct, frame.in_tx_pct, frame.out_tx_pct])
-    structural = np.maximum.reduce([frame.betweenness_pct, frame.pagerank_pct, frame.upstream_seed_count_pct])
-    temporal_risk = np.maximum(frame.same_day_ratio, frame.in_cycle.astype(float)*.65)
-    frame["priority_raw"] = (
-        .24*frame.role.map(ROLE_RISK) + .14*frame.role_score + .22*activity +
-        .20*structural + .10*temporal_risk + .10*frame.observability)
+    features = priority_features(frame, ROLE_RISK)
+    frame["priority_raw"] = sum(features[key]*weight for key,weight in PRIORITY_WEIGHTS.items())
     frame.loc[isolates, "priority_raw"] = 0.
     frame["priority_score"] = percentile(frame.priority_raw)
     frame.loc[isolates, 'priority_score'] = 0.0
@@ -389,7 +361,7 @@ def export_graph_data(frame, edges, path, limit):
                     encoding="utf-8")
 
 
-def write_outputs(frame, edges, out_dir, top_count, ui_limit):
+def write_outputs(frame, edges, out_dir, top_count, ui_limit, tx):
     out_dir.mkdir(parents=True, exist_ok=True)
     frame = frame.copy()
     frame["evidence"] = frame.apply(evidence_for, axis=1)
@@ -403,11 +375,21 @@ def write_outputs(frame, edges, out_dir, top_count, ui_limit):
     clusters = export_clusters(frame, edges)
     clusters.to_csv(out_dir/"clusters.csv", index=False, encoding="utf-8-sig")
     top = frame.sort_values(["priority_score", "gid"], ascending=[False, True]).head(max(20, top_count))
+    priority = priority_features(top, ROLE_RISK)
+    labels = {'role':'роль','confidence':'сила роли','activity':'активность','structure':'структура',
+              'temporal':'временной сигнал / цикл','coverage':'наблюдаемость'}
+    reasons = []
+    for index, row in top.iterrows():
+        terms = sorted(((key,float(priority.loc[index,key]*weight)) for key,weight in PRIORITY_WEIGHTS.items()),key=lambda t:-t[1])
+        explanation = '; '.join(f'{labels[key]} +{value:.3f}' for key,value in terms[:2])
+        reasons.append(row.evidence + (' Приоритет 0: нет наблюдаемых переводов.' if row.in_deg+row.out_deg==0 else
+                       f' Ведущие вклады в приоритет: {explanation}; raw={row.priority_raw:.3f}.'))
     top_export = pd.DataFrame({"rank": range(1, len(top)+1), "gid": top.gid.to_numpy(),
         "role": top.role.to_numpy(), "priority_score": top.priority_score.to_numpy(),
-        "why": top.evidence.to_numpy()})
+        "why": reasons})
     top_export.to_csv(out_dir/"top_nodes.csv", index=False, encoding="utf-8-sig")
     export_graph_data(frame, edges, out_dir/"graph_data.js", ui_limit)
+    export_analysis(frame, tx, out_dir, ROLE_RISK)
     counts = frame.role.value_counts().reindex(ROLES, fill_value=0)
     print("Roles:", ", ".join(f"{r}={c}" for r, c in counts.items()))
     print(f"Clusters: {len(clusters)}; top_nodes: {len(top_export)}")
@@ -415,6 +397,7 @@ def write_outputs(frame, edges, out_dir, top_count, ui_limit):
 
 
 def main():
+    started = time.perf_counter()
     parser = argparse.ArgumentParser(description="Freedom AML graph analysis")
     parser.add_argument("--data", default="./data")
     parser.add_argument("--out", default="./out")
@@ -426,7 +409,8 @@ def main():
     sanity_check(edges, nodes, tx)
     graph = build_graph(edges, nodes)
     frame = score_roles(compute_features(graph, edges, nodes, tx))
-    write_outputs(frame, edges, Path(args.out), args.top, args.ui_limit)
+    write_outputs(frame, edges, Path(args.out), args.top, args.ui_limit, tx)
+    write_manifest(Path(args.data), Path(args.out), time.perf_counter()-started)
 
 
 if __name__ == "__main__":

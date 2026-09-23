@@ -41,6 +41,7 @@ let datasetVersion='', datasetMeta={}, chatContext=null, chatBusy=false, chatCon
 let polling=false, importPending=false, serverAvailable=false;
 let detailController=null, detailData=null, detailPage=0;
 let colorMode='role';
+let analysisController=null, analysisData=null, analysisKey='', analysisTab='role', routePath=null;
 const clusterColor=id=>`hsl(${(Number(id)*137.508+75)%360} 63% 70%)`;
 const PAGE_SIZE = 20;
 
@@ -115,8 +116,12 @@ async function loadDataset(){
   if(!Array.isArray(data.nodes)||!data.nodes.length)throw new Error('Сервер вернул пустой граф');
   if(chatController)chatController.abort();
   if(detailController)detailController.abort();detailData=null;
+  if(analysisController)analysisController.abort();analysisKey='';analysisData=null;routePath=null;
+  $('showSeedPath').textContent='Путь от seed →';
   $('nodeDetails').open=false;
   datasetVersion=data.version;datasetMeta=data.meta;serverAvailable=true;
+  const audit=data.audit;
+  $('auditSummary').textContent=audit?`Проверка устойчивости · минимум ${audit.stability.min_overlap} из ${audit.stability.top_size} клиентов TOP сохраняются в ${audit.stability.runs} сценариях изменения весов на ±20%. Расчёт: ${audit.elapsed_seconds.toFixed(1)} с. Это не оценка точности ролей.`:'';
   clients=data.nodes.map(normalizeClient);clusters=data.clusters;topClients=data.top;
   edges=data.edges.map(e=>({...e,from:String(e.from),to:String(e.to)}));
   clients.sort((a,b)=>b.priority_score-a.priority_score||(BigInt(a.id)<BigInt(b.id)?-1:BigInt(a.id)>BigInt(b.id)?1:0));
@@ -138,13 +143,20 @@ async function loadDataset(){
 }
 
 function bindEvents(){
+  document.querySelectorAll('[data-analysis-tab]').forEach(b=>b.addEventListener('click',()=>{analysisTab=b.dataset.analysisTab;renderAnalysis();}));
+  $('showSeedPath').addEventListener('click',()=>{
+    if(routePath){routePath=null;renderGraph();$('showSeedPath').textContent='Путь от seed →';return;}
+    if(!analysisData?.seed_path.nodes.length){showToast('Для выбранного клиента путь не найден.');return;}
+    routePath=analysisData.seed_path;analysisTab='path';activeRole='';$('roleFilter').value='';resetTransform();renderGraph();renderAnalysis();
+    $('showSeedPath').textContent='Вернуть окружение';$('graphCanvas').scrollIntoView({behavior:'smooth',block:'center'});
+  });
   $('colorMode').addEventListener('change',()=>{colorMode=$('colorMode').value;renderGraph();});
   document.querySelectorAll('[data-view]').forEach(b=>b.addEventListener('click',()=>setView(b.dataset.view)));
   $('searchForm').addEventListener('submit',e=>{e.preventDefault();findClient($('searchInput').value);});
-  $('roleFilter').addEventListener('change',()=>{activeRole=$('roleFilter').value;renderGraph();renderLegendState();});
-  $('legend').addEventListener('click',e=>{const b=e.target.closest('[data-role]');if(!b)return;activeRole=activeRole===b.dataset.role?'':b.dataset.role;$('roleFilter').value=activeRole;renderGraph();renderLegendState();});
-  $('resetGraph').addEventListener('click',()=>{if(!clients.length)return;activeRole='';$('roleFilter').value='';centerId=clients[0].id;selectClient(centerId);resetTransform();renderGraph();renderLegendState();});
-  $('showConnections').addEventListener('click',()=>{centerId=selectedId;activeRole='';$('roleFilter').value='';resetTransform();renderGraph();renderLegendState();});
+  $('roleFilter').addEventListener('change',()=>{clearRoute();activeRole=$('roleFilter').value;renderGraph();renderLegendState();});
+  $('legend').addEventListener('click',e=>{const b=e.target.closest('[data-role]');if(!b)return;clearRoute();activeRole=activeRole===b.dataset.role?'':b.dataset.role;$('roleFilter').value=activeRole;renderGraph();renderLegendState();});
+  $('resetGraph').addEventListener('click',()=>{if(!clients.length)return;clearRoute();activeRole='';$('roleFilter').value='';centerId=clients[0].id;selectClient(centerId);resetTransform();renderGraph();renderLegendState();});
+  $('showConnections').addEventListener('click',()=>{routePath=null;$('showSeedPath').textContent='Путь от seed →';centerId=selectedId;activeRole='';$('roleFilter').value='';resetTransform();renderGraph();renderLegendState();});
   $('copyId').addEventListener('click',async()=>{try{await navigator.clipboard.writeText(selectedId);showToast('GID скопирован');}catch{showToast('Выделите GID в карточке и скопируйте его.');}});
   $('zoomIn').addEventListener('click',()=>setZoom(zoom*1.25));
   $('zoomOut').addEventListener('click',()=>setZoom(zoom/1.25));
@@ -197,7 +209,7 @@ function setView(view){
 
 function selectClient(id){
   const c=clientMap.get(id);if(!c)return;
-  if(selectedId!==id){if(detailController)detailController.abort();detailData=null;$('nodeDetails').open=false;}
+  if(selectedId!==id){if(detailController)detailController.abort();detailData=null;$('nodeDetails').open=false;routePath=null;$('showSeedPath').textContent='Путь от seed →';}
   selectedId=id;
   chatContext=id;updateChatContext();
   const meta=ROLES[c.role]||ROLES.peripheral;
@@ -216,6 +228,7 @@ function selectClient(id){
   $('boundaryNote').textContent='Граница глубины 4: исходящие неизвестны. Терминальность не подтверждена.';
   if(c.is_seed){$('boundaryNote').hidden=false;$('boundaryNote').textContent='Seed: входящие извне выборки отсутствуют. Отношение исходящих к входящим не доказывает аномалию.';}
   document.querySelectorAll('.graph-node').forEach(g=>{const circle=g.querySelector('.node-circle');circle.style.stroke=g.dataset.id===id?'#f5ffe4':'#152630';g.classList.toggle('selected',g.dataset.id===id);});
+  loadAnalysis(id);
 }
 
 function findClient(query){
@@ -223,10 +236,11 @@ function findClient(query){
   let found=clientMap.get(q);
   if(!found){const matches=clients.filter(c=>c.id.endsWith(q));if(matches.length===1)found=matches[0];else if(matches.length>1){showToast('Уточните GID: найдено несколько клиентов.');return;}}
   if(!found){showToast('Клиент с таким GID не найден.');return;}
-  centerId=found.id;selectClient(found.id);activeRole='';$('roleFilter').value='';resetTransform();renderGraph();renderLegendState();
+  clearRoute();centerId=found.id;selectClient(found.id);activeRole='';$('roleFilter').value='';resetTransform();renderGraph();renderLegendState();
 }
 
 function renderGraph(){
+  if(routePath){renderRouteGraph();return;}
   const center=clientMap.get(centerId);if(!center)return;
   const connected=edges.filter(e=>e.from===centerId||e.to===centerId);
   const weights=new Map();
@@ -244,7 +258,16 @@ function renderGraph(){
   primary.forEach((id,i)=>{const angle=-Math.PI/2+(i/Math.max(primary.length,1))*Math.PI*2;const wobble=(i%3-1)*16;positions.set(id,{x:450+Math.cos(angle)*(222+wobble),y:285+Math.sin(angle)*(172+wobble*.5),r:10+clientMap.get(id).priority_score*5});});
   extras.forEach((id,i)=>{const angle=-Math.PI/2+((i+.35)/Math.max(extras.length,1))*Math.PI*2;positions.set(id,{x:450+Math.cos(angle)*355,y:285+Math.sin(angle)*247,r:6+clientMap.get(id).priority_score*3});});
   const visibleEdges=edges.filter(e=>positions.has(e.from)&&positions.has(e.to));
-  $('graphEdges').innerHTML=visibleEdges.map(e=>{const a=positions.get(e.from),b=positions.get(e.to);const main=e.from===centerId||e.to===centerId;const mx=(a.x+b.x)/2+(b.y-a.y)*.045,my=(a.y+b.y)/2-(b.x-a.x)*.045;const path=e.from===e.to?`M${a.x-8},${a.y} C${a.x-70},${a.y-85} ${a.x+70},${a.y-85} ${a.x+8},${a.y}`:`M${a.x},${a.y} Q${mx},${my} ${b.x},${b.y}`;return `<path class="graph-edge ${main?'major':''}" d="${path}" marker-end="url(#arrow)"><title>${escapeHtml(e.from)} → ${escapeHtml(e.to)} · ${formatMoney(Number(e.sum_kzt))} · ${e.n_tx} операций</title></path>`;}).join('');
+  $('arrow').setAttribute('refX','7');
+  $('graphEdges').innerHTML=visibleEdges.map(e=>{
+    const a=positions.get(e.from),b=positions.get(e.to),main=e.from===centerId||e.to===centerId;
+    const mx=(a.x+b.x)/2+(b.y-a.y)*.045,my=(a.y+b.y)/2-(b.x-a.x)*.045;
+    const startLength=Math.hypot(mx-a.x,my-a.y)||1,endLength=Math.hypot(b.x-mx,b.y-my)||1;
+    const sx=a.x+(mx-a.x)/startLength*(a.r+3),sy=a.y+(my-a.y)/startLength*(a.r+3);
+    const ex=b.x-(b.x-mx)/endLength*(b.r+4),ey=b.y-(b.y-my)/endLength*(b.r+4);
+    const path=e.from===e.to?`M${a.x-a.r},${a.y-5} C${a.x-70},${a.y-85} ${a.x+70},${a.y-85} ${a.x+a.r+4},${a.y-5}`:`M${sx},${sy} Q${mx},${my} ${ex},${ey}`;
+    return `<path class="graph-edge ${main?'major':''}" d="${path}" marker-end="url(#arrow)"><title>${escapeHtml(e.from)} → ${escapeHtml(e.to)} · ${formatMoney(Number(e.sum_kzt))} · ${e.n_tx} операций</title></path>`;
+  }).join('');
   $('graphNodes').innerHTML=[...positions].map(([id,p])=>{
     const c=clientMap.get(id),role=ROLES[c.role]||ROLES.peripheral,m={...role,color:colorMode==='cluster'?clusterColor(c.cluster_id):role.color},isCenter=id===centerId,major=primarySet.has(id),showLabel=isCenter||(major&&primary.indexOf(id)%2===0);
     return `<g class="graph-node" data-id="${id}" data-cluster="${c.cluster_id}" role="button" tabindex="0" aria-label="Клиент ${id}, ${m.label}, кластер ${c.cluster_id}" transform="translate(${p.x},${p.y})"><title>${id}\n${m.label} · Кластер #${c.cluster_id}\n${formatMoney(c.out_kzt)} отправлено</title>${isCenter?'<circle class="center-pulse" r="45"/>':''}<circle class="node-halo" r="${p.r+(isCenter?11:5)}" fill="${m.color}"/><circle class="node-circle" r="${p.r}" fill="${m.color}"/>${isCenter?`<text class="node-initials" text-anchor="middle" dominant-baseline="central" style="font-size:17px!important">${m.initial}</text>`:''}${showLabel?`<text class="${isCenter?'center-label':''}" text-anchor="middle" y="${p.r+17}">${isCenter?'GID ':''}${shortId(id)}</text>`:''}${isCenter?`<text text-anchor="middle" y="${p.r+33}" style="font-size:11px">${colorMode==='cluster'?'Кластер #'+String(c.cluster_id).padStart(2,'0'):m.label}</text>`:''}</g>`;
@@ -256,6 +279,62 @@ function renderGraph(){
   renderGraphLegend([...positions.keys()]);
   selectClient(selectedId);
 }
+function clearRoute(){routePath=null;$('showSeedPath').textContent='Путь от seed →';}
+
+async function loadAnalysis(id){
+  const key=datasetVersion+':'+id;if(key===analysisKey)return;
+  analysisKey=key;analysisData=null;
+  if(analysisController)analysisController.abort();
+  const controller=new AbortController();analysisController=controller;
+  $('analysisClient').textContent='GID '+id;$('analysisContent').textContent='Загрузка проверяемых оснований…';$('showSeedPath').disabled=true;
+  try{
+    const data=await api(`/api/node/${encodeURIComponent(id)}?version=${encodeURIComponent(datasetVersion)}`,{controller});
+    if(analysisKey!==key||controller.signal.aborted)return;
+    analysisData=data;$('showSeedPath').disabled=!data.seed_path.nodes.length;renderAnalysis();
+  }catch(error){
+    if(analysisKey!==key||controller.signal.aborted)return;
+    analysisKey='';$('analysisContent').textContent='Разбор временно недоступен: '+error.message;
+    const retry=document.createElement('button');retry.className='button';retry.textContent='Повторить';retry.addEventListener('click',()=>loadAnalysis(selectedId));$('analysisContent').append(retry);
+  }
+}
+
+function renderAnalysis(){
+  document.querySelectorAll('[data-analysis-tab]').forEach(b=>b.setAttribute('aria-selected',String(b.dataset.analysisTab===analysisTab)));
+  if(!analysisData)return;
+  const {analysis:a,client:c,seed_path:path,daily}=analysisData;
+  const pct=n=>(n*100).toFixed(1).replace('.',',');
+  const role=r=>(ROLES[r]||ROLES.peripheral).label;
+  const warning=c.is_seed?'Вход seed неполон: доли от входящего объёма не отражают весь оборот.':c.truncated?'Глубина 4: отсутствие исходящих не подтверждает, что деньги осели.':'';
+  const next={consolidator:'Проверить связь плательщиков и получателей, назначение переводов и экономический смысл сбора.',
+    distributor:'Проверить получателей, основания выплат и повторяемость распределения.',transit:'Запросить время операций и полный оборот: дневные суммы не доказывают транзит тех же денег.',
+    coordinator:'Проверить связанные ветви и межкластерные связи. Структурная роль не устанавливает контроль над клиентами.',
+    terminal:'Запросить последующие исходящие и полный период наблюдения до вывода о конечном получателе.',
+    peripheral:'Сопоставить с контекстом клиента; низкий приоритет не исключает риска.'}[c.role];
+  if(analysisTab==='role'){
+    $('analysisContent').innerHTML=`<div class="explanation-grid"><div><span class="eyebrow">РАБОЧАЯ ГИПОТЕЗА</span><h3>${role(a.winner)} <span class="score-inline">${pct(a.winner_score)} / 100</span></h3><p>Альтернатива: ${role(a.runner_up)} · ${pct(a.runner_score)}. Разница ${pct(a.margin)} п.п. ${a.margin<.05?'Гипотезы близки — роль требует особой проверки.':''}</p><div class="contribution-list">${a.terms.map(t=>`<div><span>${escapeHtml(t.label)}</span><strong>+${pct(t.contribution)}</strong><i style="width:${Math.max(0,Math.min(100,t.contribution*100))}%"></i></div>`).join('')}</div><p class="analysis-note">Слагаемые скоринговой формулы; сумма ограничена 100. Это не вероятность. Признаки нормированы относительно текущей выборки.</p></div><div><span class="eyebrow">СРАВНЕНИЕ ВСЕХ РОЛЕЙ</span><div class="role-comparison">${a.roles.map(r=>`<div title="${escapeHtml(r.rule)}"><div><span>${role(r.role)}</span><strong>${pct(r.score)}</strong></div><i><b style="width:${r.score*100}%;background:${ROLES[r.role].color}"></b></i><small>${r.eligible?escapeHtml(r.rule):'Условие роли не выполнено: '+escapeHtml(r.rule)}</small></div>`).join('')}</div></div></div><div class="analysis-takeaway"><strong>Следующий шаг</strong><p>${next}</p><span>Место при изменении весов: ${a.stability.rank_min}–${a.stability.rank_max}; в TOP-${Math.min(20,clients.length)} в ${a.stability.top_hits} из ${a.stability.runs} сценариев. Это не доверительный интервал.</span>${warning?`<p>${warning}</p>`:''}</div>`;
+  }else if(analysisTab==='time'){
+    const t=a.temporal,max=Math.max(1,...daily.flatMap(d=>[d.incoming,d.outgoing]));
+    $('analysisContent').innerHTML=`<div class="temporal-heading"><div><span class="eyebrow">НАБЛЮДАЕМЫЕ ОБЪЁМЫ · 1–2 ДНЯ</span><h3>${formatMoney(t.matched_kzt)}</h3><p>Сопоставлено с последующим выходом · ${pct(t.ratio)}% наблюдаемого входа. Совпадений: ${t.total_windows}.</p></div><div class="daily-legend"><span>● Вход</span><span>● Выход</span></div></div><div class="daily-chart" role="img" aria-label="Входящие и исходящие суммы по активным дням. Точные числа доступны в разделе всех переводов.">${daily.map(d=>`<div class="day-column" title="${d.date}: вход ${formatMoney(d.incoming)}, выход ${formatMoney(d.outgoing)}"><div class="day-bars"><i style="height:${d.incoming/max*100}%"></i><b style="height:${d.outgoing/max*100}%"></b></div><small>${d.date.slice(8)}.${d.date.slice(5,7)}</small></div>`).join('')||'<p>Переводов нет.</p>'}</div><p class="analysis-note">Показаны активные дни, а не непрерывная шкала времени. ${escapeHtml(t.method)} Временной сигнал 1–2 дня служит дополнительной проверкой и не меняет присвоенную роль.</p>${warning?`<p class="analysis-warning">${warning}</p>`:''}<div class="table-wrap"><table><thead><tr><th>Входящий день</th><th>Исходящий день</th><th>Задержка</th><th>Сопоставленная сумма</th></tr></thead><tbody>${t.windows.slice(0,5).map(w=>`<tr><td>${w.from_date}</td><td>${w.to_date}</td><td>${w.lag_days} дн.</td><td>${formatMoney(w.matched_kzt)}</td></tr>`).join('')||'<tr><td colspan="4">Совпадений в окне 1–2 дня нет. Это не исключает другие временные паттерны.</td></tr>'}</tbody></table></div><p class="analysis-note">До 5 крупнейших совпадений. Для проверки исходных сумм откройте «Все переводы и активные дни» ниже.</p>`;
+  }else{
+    $('analysisContent').innerHTML=`<h3>${path.edges.length?`${path.edges.length} перехода от seed до клиента`:path.nodes.length?'Выбранный клиент — seed':'Путь не найден'}</h3><p>${escapeHtml(path.note)}</p><div class="route-list">${path.nodes.map((id,i)=>`<div><span class="route-step">${i}</span><button class="client-link" data-client="${id}">${id}</button><span>${role(clientMap.get(id).role)}</span>${path.edges[i]?`<small>↓ ${formatMoney(path.edges[i].sum_kzt)} · ${path.edges[i].n_tx} операций за период</small>`:''}</div>`).join('')}</div><p class="analysis-note">Это путь по агрегированным рёбрам, а не доказанная последовательность транзакций. Все найденные прямые связи доступны в таблице ниже.</p>`;
+  }
+  if(analysisTab==='role'){
+    $('analysisContent').insertAdjacentHTML('afterbegin',`<div class="analysis-facts"><span><strong>${c.in_tx} / ${c.out_tx}</strong>операций вход / выход</span><span><strong>${c.upstream_seed_count}</strong>сходящихся seed-ветвей</span><span><strong>${c.cross_cluster_count}</strong>соседних кластеров</span><span><strong>${pct(c.same_day_ratio)}%</strong>совпадение в один день</span></div>`);
+    $('analysisContent').insertAdjacentHTML('beforeend',`<details class="priority-explanation"><summary>Как рассчитан приоритет проверки</summary><p>Сырой балл ${a.priority_raw.toFixed(4)} переводится в перцентиль внутри текущего датасета. Итог ${(c.priority_score*100).toFixed(1)} / 100 — относительное место, не вероятность нарушения.</p><div class="contribution-list">${a.priority_terms.map(t=>`<div><span>${escapeHtml(t.label)}</span><strong>${t.contribution.toFixed(4)}</strong></div>`).join('')}</div></details>`);
+  }
+}
+
+function renderRouteGraph(){
+  $('arrow').setAttribute('refX','7');
+  const path=routePath, ids=path.nodes;
+  const pos=new Map(ids.map((id,i)=>[id,{x:ids.length===1?450:90+i*720/(ids.length-1),y:285,r:22}]));
+  $('graphEdges').innerHTML=path.edges.map(e=>{const a=pos.get(e.from),b=pos.get(e.to);return `<path class="graph-edge major route-edge" d="M${a.x+26},${a.y} L${b.x-26},${b.y}" marker-end="url(#arrow)"/><text class="route-amount" text-anchor="middle" x="${(a.x+b.x)/2}" y="254">${escapeHtml(formatMoney(e.sum_kzt))}</text><text class="route-count" text-anchor="middle" x="${(a.x+b.x)/2}" y="325">${e.n_tx} операций</text>`;}).join('');
+  $('graphNodes').innerHTML=ids.map((id,i)=>{const p=pos.get(id),c=clientMap.get(id),color=colorMode==='cluster'?clusterColor(c.cluster_id):ROLES[c.role].color;return `<g class="graph-node" data-id="${id}" role="button" tabindex="0" aria-label="Клиент ${id}" transform="translate(${p.x},${p.y})"><circle class="node-halo" r="30" fill="${color}"/><circle class="node-circle" r="22" fill="${color}"/><text class="node-initials" text-anchor="middle" dominant-baseline="central">${i}</text><text text-anchor="middle" y="60">${shortId(id)}</text><text text-anchor="middle" y="80">${i===0?'Seed':ROLES[c.role].label}</text></g>`;}).join('');
+  $('graphNodes').querySelectorAll('.graph-node').forEach(g=>{const open=()=>{routePath=null;centerId=g.dataset.id;selectClient(centerId);$('showSeedPath').textContent='Путь от seed →';renderGraph();};g.addEventListener('click',open);g.addEventListener('keydown',e=>{if(e.key==='Enter'||e.key===' '){e.preventDefault();open();}});});
+  $('graphCaption').textContent=`Путь от seed · ${path.edges.length} перехода · суммы за весь период`;
+  $('network').setAttribute('aria-label',`Один направленный путь от seed: ${path.edges.length} перехода`);renderGraphLegend(ids);
+}
+
 function setZoom(value){zoom=Math.max(.5,Math.min(2.8,value));applyTransform();}
 function applyTransform(){$('graphTransform').style.transform=`translate(${pan.x}px,${pan.y}px) scale(${zoom})`;}
 function resetTransform(){zoom=1;pan={x:0,y:0};applyTransform();}
