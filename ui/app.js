@@ -22,12 +22,12 @@ const ICONS = {
   spark:'<path d="m12 3 2.6 6.4L21 12l-6.4 2.6L12 21l-2.6-6.4L3 12l6.4-2.6L12 3Z"/>'
 };
 const ROLES = {
-  coordinator:{label:'Координатор',color:'#72985c',initial:'К'},
-  consolidator:{label:'Сборщик',color:'#d29c72',initial:'С'},
-  distributor:{label:'Распределитель',color:'#779fba',initial:'Р'},
-  transit:{label:'Транзит',color:'#b4a05e',initial:'Т'},
-  terminal:{label:'Конечный',color:'#a393bc',initial:'П'},
-  peripheral:{label:'Периферия',color:'#afbcaa',initial:'•'}
+  coordinator:{label:'Координатор',color:'#c1ee79',initial:'К'},
+  consolidator:{label:'Сборщик',color:'#f5ad77',initial:'С'},
+  distributor:{label:'Распределитель',color:'#71b9ec',initial:'Р'},
+  transit:{label:'Транзит',color:'#f0d27e',initial:'Т'},
+  terminal:{label:'Конечный',color:'#bba3f1',initial:'П'},
+  peripheral:{label:'Периферия',color:'#859ca9',initial:'•'}
 };
 const $ = id => document.getElementById(id);
 const escapeHtml = value => String(value ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
@@ -40,6 +40,8 @@ let currentView = 'graph', activeRole = '', page = 0, zoom = 1, pan = {x:0,y:0},
 let datasetVersion='', datasetMeta={}, chatContext=null, chatBusy=false, chatController=null, loadSequence=0;
 let polling=false, importPending=false, serverAvailable=false;
 let detailController=null, detailData=null, detailPage=0;
+let colorMode='role';
+const clusterColor=id=>`hsl(${(Number(id)*137.508+75)%360} 63% 70%)`;
 const PAGE_SIZE = 20;
 
 function renderIcons(root = document) {
@@ -129,13 +131,14 @@ async function loadDataset(){
   $('sidebarPeriod').textContent=period;$('headerPeriod').textContent=period;$('volumePeriod').textContent=period;
   $('datasetLabel').textContent=datasetMeta.label;
   $('datasetDetails').textContent=`${formatNumber(datasetMeta.edges)} пар · ${formatNumber(datasetMeta.transactions)} операций · глубина до ${datasetMeta.max_depth}`;
-  $('agentBrief').textContent=`${formatNumber(datasetMeta.truncated)} клиентов на границе выборки. Узнайте, кого проверить первым и почему.`;
+  $('agentBrief').textContent=`${formatNumber(datasetMeta.truncated)} клиентов на границе выборки. Разберите роли и ограничения с ассистентом.`;
   document.querySelectorAll('a[download]').forEach(a=>{const url=new URL(a.href);url.searchParams.set('version',datasetVersion);a.href=url.toString();});
   $('connectionNotice').hidden=true;$('connectionNotice').classList.remove('error');
   clearChat();
 }
 
 function bindEvents(){
+  $('colorMode').addEventListener('change',()=>{colorMode=$('colorMode').value;renderGraph();});
   document.querySelectorAll('[data-view]').forEach(b=>b.addEventListener('click',()=>setView(b.dataset.view)));
   $('searchForm').addEventListener('submit',e=>{e.preventDefault();findClient($('searchInput').value);});
   $('roleFilter').addEventListener('change',()=>{activeRole=$('roleFilter').value;renderGraph();renderLegendState();});
@@ -169,16 +172,24 @@ function renderSummary(){
 }
 
 function renderLegend(){
-  $('legend').innerHTML=Object.entries(ROLES).map(([r,m])=>`<button data-role="${r}" aria-pressed="false"><i style="background:${m.color}"></i>${m.label}</button>`).join('');
   $('roleFilter').innerHTML='<option value="">Все роли</option>'+Object.entries(ROLES).map(([r,m])=>`<option value="${r}">${m.label}</option>`).join('');
+}
+function renderGraphLegend(visibleIds){
+  if(colorMode==='cluster'){
+    const ids=[...new Set(visibleIds.map(id=>clientMap.get(id).cluster_id))].sort((a,b)=>a-b);
+    $('legend').innerHTML='<span class="legend-caption">Кластеры фрагмента</span>'+ids.map(id=>`<span class="cluster-legend"><i style="background:${clusterColor(id)}"></i>#${String(id).padStart(2,'0')}</span>`).join('');
+  }else{
+    $('legend').innerHTML=Object.entries(ROLES).map(([r,m])=>`<button data-role="${r}" aria-pressed="false"><i style="background:${m.color}"></i>${m.label}</button>`).join('');
+    renderLegendState();
+  }
 }
 function renderLegendState(){document.querySelectorAll('[data-role]').forEach(b=>{b.classList.toggle('active',b.dataset.role===activeRole);b.setAttribute('aria-pressed',String(b.dataset.role===activeRole));});}
 
 function setView(view){
   currentView=view;
   document.querySelector('main').classList.toggle('assistant-open',view==='assistant');
-  $('pageTitle').textContent=view==='assistant'?'Ассистент исследования':'Увидеть связи. Понять структуру.';
-  $('pageDescription').textContent=view==='assistant'?'Задайте вопрос — получите расчёт, основание и переход к клиенту.':'Исследуйте потоки. Проверяйте гипотезы. Объясняйте решения.';
+  $('pageTitle').textContent={graph:'За переводами — связи.',queue:'Фокус на главном.',clusters:'Структура сети.',assistant:'Вопрос. Данные. Объяснение.'}[view];
+  $('pageDescription').textContent={graph:'Исследуйте сеть. Находите ключевых участников.',queue:'Клиенты в порядке приоритета для углублённой проверки.',clusters:'Сообщества, направления потоков и ключевые участники.',assistant:'Разберите гипотезу и перейдите к её основаниям.'}[view];
   ['graph','queue','clusters','assistant'].forEach(v=>{$(v+'View').hidden=v!==view;});
   document.querySelectorAll('[data-view]').forEach(b=>{b.classList.toggle('active',b.dataset.view===view);if(b.getAttribute('role')==='tab')b.setAttribute('aria-selected',String(b.dataset.view===view));});
   $('breadcrumbTitle').textContent={graph:'Граф денег',queue:'Клиенты',clusters:'Кластеры',assistant:'AI-ассистент'}[view];
@@ -204,7 +215,7 @@ function selectClient(id){
   $('boundaryNote').hidden=!c.truncated;
   $('boundaryNote').textContent='Граница глубины 4: исходящие неизвестны. Терминальность не подтверждена.';
   if(c.is_seed){$('boundaryNote').hidden=false;$('boundaryNote').textContent='Seed: входящие извне выборки отсутствуют. Отношение исходящих к входящим не доказывает аномалию.';}
-  document.querySelectorAll('.graph-node').forEach(g=>{const circle=g.querySelector('.node-circle');circle.style.stroke=g.dataset.id===id?'#425f35':'#fff';});
+  document.querySelectorAll('.graph-node').forEach(g=>{const circle=g.querySelector('.node-circle');circle.style.stroke=g.dataset.id===id?'#f5ffe4':'#152630';g.classList.toggle('selected',g.dataset.id===id);});
 }
 
 function findClient(query){
@@ -235,13 +246,14 @@ function renderGraph(){
   const visibleEdges=edges.filter(e=>positions.has(e.from)&&positions.has(e.to));
   $('graphEdges').innerHTML=visibleEdges.map(e=>{const a=positions.get(e.from),b=positions.get(e.to);const main=e.from===centerId||e.to===centerId;const mx=(a.x+b.x)/2+(b.y-a.y)*.045,my=(a.y+b.y)/2-(b.x-a.x)*.045;const path=e.from===e.to?`M${a.x-8},${a.y} C${a.x-70},${a.y-85} ${a.x+70},${a.y-85} ${a.x+8},${a.y}`:`M${a.x},${a.y} Q${mx},${my} ${b.x},${b.y}`;return `<path class="graph-edge ${main?'major':''}" d="${path}" marker-end="url(#arrow)"><title>${escapeHtml(e.from)} → ${escapeHtml(e.to)} · ${formatMoney(Number(e.sum_kzt))} · ${e.n_tx} операций</title></path>`;}).join('');
   $('graphNodes').innerHTML=[...positions].map(([id,p])=>{
-    const c=clientMap.get(id),m=ROLES[c.role]||ROLES.peripheral,isCenter=id===centerId,major=primarySet.has(id),showLabel=isCenter||(major&&primary.indexOf(id)%2===0);
-    return `<g class="graph-node" data-id="${id}" role="button" tabindex="0" aria-label="Клиент ${id}, ${m.label}" transform="translate(${p.x},${p.y})"><title>${id}\n${m.label}\n${formatMoney(c.out_kzt)} отправлено</title>${isCenter?'<circle class="center-pulse" r="45"/>':''}<circle class="node-halo" r="${p.r+(isCenter?11:5)}" fill="${m.color}"/><circle class="node-circle" r="${p.r}" fill="${m.color}"/>${isCenter?`<text class="node-initials" text-anchor="middle" dominant-baseline="central" style="font-size:17px!important">${m.initial}</text>`:''}${showLabel?`<text class="${isCenter?'center-label':''}" text-anchor="middle" y="${p.r+17}">${isCenter?'GID ':''}${shortId(id)}</text>`:''}${isCenter?`<text text-anchor="middle" y="${p.r+33}" style="font-size:9px">${m.label}</text>`:''}</g>`;
+    const c=clientMap.get(id),role=ROLES[c.role]||ROLES.peripheral,m={...role,color:colorMode==='cluster'?clusterColor(c.cluster_id):role.color},isCenter=id===centerId,major=primarySet.has(id),showLabel=isCenter||(major&&primary.indexOf(id)%2===0);
+    return `<g class="graph-node" data-id="${id}" data-cluster="${c.cluster_id}" role="button" tabindex="0" aria-label="Клиент ${id}, ${m.label}, кластер ${c.cluster_id}" transform="translate(${p.x},${p.y})"><title>${id}\n${m.label} · Кластер #${c.cluster_id}\n${formatMoney(c.out_kzt)} отправлено</title>${isCenter?'<circle class="center-pulse" r="45"/>':''}<circle class="node-halo" r="${p.r+(isCenter?11:5)}" fill="${m.color}"/><circle class="node-circle" r="${p.r}" fill="${m.color}"/>${isCenter?`<text class="node-initials" text-anchor="middle" dominant-baseline="central" style="font-size:17px!important">${m.initial}</text>`:''}${showLabel?`<text class="${isCenter?'center-label':''}" text-anchor="middle" y="${p.r+17}">${isCenter?'GID ':''}${shortId(id)}</text>`:''}${isCenter?`<text text-anchor="middle" y="${p.r+33}" style="font-size:11px">${colorMode==='cluster'?'Кластер #'+String(c.cluster_id).padStart(2,'0'):m.label}</text>`:''}</g>`;
   }).join('');
   $('graphNodes').querySelectorAll('.graph-node').forEach(g=>{g.addEventListener('click',()=>selectClient(g.dataset.id));g.addEventListener('keydown',e=>{if(e.key==='Enter'||e.key===' '){e.preventDefault();selectClient(g.dataset.id);}});});
   $('graphCaption').textContent=connected.length?`Фрагмент · ${positions.size} узлов · ${visibleEdges.length} связей. Прямых контрагентов показано ${primary.length} из ${direct.length}`:'У клиента нет переводов в наблюдаемом графе';
   $('network').setAttribute('role','group');
   $('network').setAttribute('aria-label',`Граф клиента ${centerId}: ${positions.size} узлов, ${visibleEdges.length} рёбер. Показана часть связей.`);
+  renderGraphLegend([...positions.keys()]);
   selectClient(selectedId);
 }
 function setZoom(value){zoom=Math.max(.5,Math.min(2.8,value));applyTransform();}
