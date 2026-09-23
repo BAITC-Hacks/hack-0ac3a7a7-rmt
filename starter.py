@@ -16,6 +16,7 @@ from pathlib import Path
 import networkx as nx
 import numpy as np
 import pandas as pd
+import pyarrow.parquet as pq
 
 ROLES = ["consolidator", "transit", "distributor", "terminal", "coordinator", "peripheral"]
 ROLE_RISK = {"coordinator": 1.0, "consolidator": .92, "distributor": .86,
@@ -24,31 +25,75 @@ RANDOM_SEED = 42
 
 
 def load(data_dir: Path):
-    edges = pd.read_parquet(data_dir / "edges.parquet")
-    nodes = pd.read_parquet(data_dir / "nodes.parquet")
-    tx = pd.read_parquet(data_dir / "transactions.parquet")
-    tx["date"] = pd.to_datetime(tx["date"])
+    schemas = {'nodes':['gid','depth','is_seed'], 'edges':['src','dst','sum_kzt','n_tx','depth'],
+               'transactions':['src','dst','date','sum_kzt']}
+    for name, limit in [('nodes', 10000), ('edges', 100000), ('transactions', 500000)]:
+        parquet = pq.ParquetFile(data_dir / f'{name}.parquet')
+        metadata = parquet.metadata
+        missing = set(schemas[name]) - set(parquet.schema_arrow.names)
+        if missing:
+            raise ValueError(f'{name}: отсутствуют колонки {", ".join(sorted(missing))}')
+        if metadata.num_rows > limit:
+            raise ValueError(f'{name}: превышен лимит локальной версии ({limit} строк)')
+        if sum(metadata.row_group(i).total_byte_size for i in range(metadata.num_row_groups)) > 128*1024*1024:
+            raise ValueError(f'{name}: распакованный файл превышает 128 МБ')
+    edges = pd.read_parquet(data_dir / "edges.parquet", columns=['src','dst','sum_kzt','n_tx','depth'])
+    nodes = pd.read_parquet(data_dir / "nodes.parquet", columns=['gid','depth','is_seed'])
+    tx = pd.read_parquet(data_dir / "transactions.parquet", columns=['src','dst','date','sum_kzt'])
+    if 'date' not in tx:
+        raise ValueError('transactions: отсутствует колонка date')
+    if pd.api.types.is_numeric_dtype(tx.date):
+        raise ValueError('transactions.date: нужна дата, а не числовой timestamp без единиц измерения')
+    tx["date"] = pd.to_datetime(tx["date"], errors='raise').dt.normalize()
     return edges, nodes, tx
 
 
 def sanity_check(edges, nodes, tx):
-    assert {"src", "dst", "sum_kzt", "n_tx", "depth"} <= set(edges.columns)
-    assert {"gid", "depth", "is_seed"} <= set(nodes.columns)
-    assert {"src", "dst", "date", "sum_kzt"} <= set(tx.columns)
-    assert nodes.gid.is_unique and not edges[["src", "dst"]].duplicated().any()
-    assert not edges.isna().any().any() and not nodes.isna().any().any() and not tx.isna().any().any()
+    specs = [(edges, 'edges', ['src','dst','sum_kzt','n_tx','depth']),
+             (nodes, 'nodes', ['gid','depth','is_seed']),
+             (tx, 'transactions', ['src','dst','date','sum_kzt'])]
+    for data, name, columns in specs:
+        missing = set(columns) - set(data.columns)
+        if missing:
+            raise ValueError(f'{name}: отсутствуют колонки {", ".join(sorted(missing))}')
+        if data[columns].isna().any().any():
+            raise ValueError(f'{name}: обязательные поля содержат пропуски')
+        for col in set(columns) & {'gid','src','dst','depth','n_tx'}:
+            if not pd.api.types.is_integer_dtype(data[col]):
+                raise ValueError(f'{name}.{col}: нужен целочисленный тип; float GID теряет точность')
+        if 'sum_kzt' in columns:
+            if not pd.api.types.is_numeric_dtype(data.sum_kzt) or not np.isfinite(data.sum_kzt).all() or (data.sum_kzt <= 0).any():
+                raise ValueError(f'{name}.sum_kzt: нужны положительные конечные суммы')
+    if nodes.empty:
+        raise ValueError('nodes: нужен хотя бы один клиент')
+    if not pd.api.types.is_bool_dtype(nodes.is_seed):
+        raise ValueError('nodes.is_seed: нужен логический тип bool')
+    if not nodes.gid.is_unique or edges[['src','dst']].duplicated().any():
+        raise ValueError('Повторные GID или неагрегированные пары рёбер')
+    if (nodes.gid < 0).any():
+        raise ValueError('gid должен быть неотрицательным целым числом')
+    if not nodes.depth.between(0,4).all() or not edges.depth.between(1,4).all():
+        raise ValueError('Ожидается граф с глубиной узлов 0–4 и рёбер 1–4')
+    if not (nodes.is_seed == (nodes.depth == 0)).all():
+        raise ValueError('depth=0 должен совпадать с is_seed=True')
+    if (edges.n_tx <= 0).any():
+        raise ValueError('edges.n_tx: количество переводов должно быть положительным')
     aggregate = tx.groupby(["src", "dst"], as_index=False).agg(
         tx_sum=("sum_kzt", "sum"), tx_count=("sum_kzt", "size"))
     merged = edges.merge(aggregate, on=["src", "dst"], how="outer", indicator=True)
-    assert (merged._merge == "both").all(), "edges и transactions не сходятся по парам"
-    assert np.allclose(merged.sum_kzt, merged.tx_sum), "edges и transactions не сходятся по суммам"
-    assert (merged.n_tx == merged.tx_count).all(), "edges и transactions не сходятся по количеству"
+    if not (merged._merge == 'both').all():
+        raise ValueError('edges и transactions не сходятся по парам')
+    if not np.allclose(merged.sum_kzt, merged.tx_sum, rtol=0, atol=.01):
+        raise ValueError('edges и transactions не сходятся по суммам (допуск 0.01 KZT)')
+    if not (merged.n_tx == merged.tx_count).all():
+        raise ValueError('edges и transactions не сходятся по количеству')
     graph_nodes = set(edges.src) | set(edges.dst)
-    assert graph_nodes <= set(nodes.gid), "В edges присутствуют неизвестные gid"
+    if not graph_nodes <= set(nodes.gid):
+        raise ValueError('В edges присутствуют неизвестные gid')
     orphans = set(nodes.gid) - graph_nodes
     print(f"Data: {len(nodes):,} nodes, {len(edges):,} edges, {len(tx):,} transactions, "
           f"{edges.sum_kzt.sum():,.2f} KZT")
-    print(f"Period: {tx.date.min().date()} - {tx.date.max().date()}; isolated nodes: {len(orphans)}")
+    print(f"Transactions: {len(tx)}; isolated nodes: {len(orphans)}")
 
 
 def build_graph(edges, nodes):
@@ -110,7 +155,7 @@ def community_features(graph):
         else:
             undirected.add_edge(source, target, strength=strength)
     communities = nx.community.louvain_communities(
-        undirected, weight="strength", resolution=1., seed=RANDOM_SEED)
+        undirected, weight="strength", resolution=1., seed=RANDOM_SEED) if undirected.number_of_edges() else [{node} for node in graph]
     ordered = sorted(communities, key=lambda group: (-len(group), min(group)))
     return {node: cid for cid, group in enumerate(ordered) for node in group}, undirected
 
@@ -170,7 +215,7 @@ def compute_features(graph, edges, nodes, tx):
     frame["is_articulation"] = frame.gid.isin(articulation)
 
     components = list(nx.strongly_connected_components(graph))
-    cyclic = {node for component in components if len(component) > 1 for node in component}
+    cyclic = {node for component in components if len(component) > 1 for node in component} | set(nx.nodes_with_selfloops(graph))
     frame["in_cycle"] = frame.gid.isin(cyclic)
     reciprocal = Counter()
     for source, target in graph.edges:
@@ -249,6 +294,7 @@ def score_roles(frame):
         .20*structural + .10*temporal_risk + .10*frame.observability)
     frame.loc[isolates, "priority_raw"] = 0.
     frame["priority_score"] = percentile(frame.priority_raw)
+    frame.loc[isolates, 'priority_score'] = 0.0
     return frame
 
 
@@ -262,7 +308,7 @@ def money(value):
 
 def evidence_for(row):
     if row.in_deg == 0 and row.out_deg == 0:
-        return "Изолированный seed: 0 входящих и 0 исходящих рёбер в наблюдаемом графе."
+        return "Изолированный узел: 0 входящих и 0 исходящих рёбер в наблюдаемом графе."
     if row.role == "consolidator":
         text = (f"Признаки сбора: {row.in_deg} плательщ., {row.in_tx} tx, {money(row.in_kzt)} KZT; "
                 f"выход: {row.out_deg} получ., {money(row.out_kzt)} KZT; seed-ветвей {row.upstream_seed_count}.")
@@ -274,9 +320,9 @@ def evidence_for(row):
                 f"совпадение в тот же день {row.same_day_ratio:.0%}, двусторонних дней {int(row.both_direction_days)}.")
     elif row.role == "coordinator":
         text = (f"Связующий профиль: seed-ветвей {row.upstream_seed_count}, соседних кластеров {row.cross_cluster_count}; "
-                f"in/out degree {row.in_deg}/{row.out_deg}, bridge pctl {row.betweenness_pct:.0%}.")
+                f"плательщ./получ. {row.in_deg}/{row.out_deg}, посредничество: перцентиль {row.betweenness_pct:.0%}.")
     elif row.role == "terminal":
-        note = "обрезан на depth=4; терминальность вероятностная" if row.truncated_by_depth else "исходящих рёбер 0"
+        note = "depth=4: исходящие неизвестны" if row.truncated_by_depth else "исходящих рёбер 0 в выборке"
         text = f"Получатель-кандидат: {row.in_deg} плательщ., {row.in_tx} tx, {money(row.in_kzt)} KZT; {note}."
     else:
         note = "depth=4, исходящие неизвестны" if row.truncated_by_depth else "выраженной структурной роли нет"
@@ -289,7 +335,7 @@ def evidence_for(row):
 def cluster_hypothesis(group):
     counts = group.role.value_counts()
     if len(group) == 1 and group.iloc[0].in_deg + group.iloc[0].out_deg == 0:
-        return "Изолированный seed без наблюдаемых переводов"
+        return "Изолированный клиент без наблюдаемых переводов"
     label = {"consolidator": "контур сбора", "distributor": "контур распределения",
              "transit": "транзитная цепочка", "terminal": "группа конечных получателей",
              "coordinator": "связующий контур", "peripheral": "периферийная группа"}[counts.index[0]]
@@ -350,7 +396,9 @@ def write_outputs(frame, edges, out_dir, top_count, ui_limit):
     required = ["gid", "role", "role_score", "cluster_id", "priority_score", "evidence"]
     useful = ["in_deg", "out_deg", "in_kzt", "out_kzt", "in_tx", "out_tx", "pagerank",
               "pass_through", "depth", "is_seed", "truncated_by_depth", "observability",
-              "upstream_seed_count", "betweenness", "same_day_ratio", "in_cycle"]
+              "upstream_seed_count", "betweenness", "same_day_ratio", "in_cycle",
+              "cross_cluster_count", "is_articulation", "both_direction_days", "active_days",
+              "flow_balance", "priority_raw"] + ['score_' + role for role in ROLES]
     frame[required+useful].to_csv(out_dir/"nodes_roles.csv", index=False, encoding="utf-8-sig")
     clusters = export_clusters(frame, edges)
     clusters.to_csv(out_dir/"clusters.csv", index=False, encoding="utf-8-sig")

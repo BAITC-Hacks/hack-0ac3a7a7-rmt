@@ -37,6 +37,9 @@ const formatMoney = n => n >= 1e6 ? `${(n/1e6).toLocaleString('ru-RU',{maximumFr
 const shortId = id => '…' + String(id).slice(-9);
 let clients = [], clusters = [], topClients = [], clientMap = new Map(), edges = [], selectedId, centerId;
 let currentView = 'graph', activeRole = '', page = 0, zoom = 1, pan = {x:0,y:0}, toastTimer;
+let datasetVersion='', datasetMeta={}, chatContext=null, chatBusy=false, chatController=null, loadSequence=0;
+let polling=false, importPending=false, serverAvailable=false;
+let detailController=null, detailData=null, detailPage=0;
 const PAGE_SIZE = 20;
 
 function renderIcons(root = document) {
@@ -77,33 +80,67 @@ function normalizeClient(row) {
 }
 
 document.addEventListener('DOMContentLoaded', async()=>{
-  renderIcons(); bindEvents();
-  const data=window.graphData;
-  if(!data?.nodes?.length){$('graphCaption').textContent='Нет данных для отображения';showToast('Сначала сформируйте результаты анализа.');return;}
-  clients=data.nodes.map(normalizeClient);
+  renderIcons(); bindEvents(); bindWorkspace();
+  try { await loadDataset(); await pollStatus(); }
+  catch(error){connectionError(error);}
+  setInterval(()=>{if(!document.hidden)pollStatus();},4000);
+  document.addEventListener('visibilitychange',()=>{if(!document.hidden)pollStatus();});
+});
+
+async function api(path, options={}){
+  const controller=options.controller||new AbortController();
+  const timeout=setTimeout(()=>controller.abort(),options.timeout||15000);
+  try{
+    const response=await fetch(path,{method:options.body?'POST':'GET',headers:options.body?{'Content-Type':'application/json'}:{},body:options.body?JSON.stringify(options.body):undefined,signal:controller.signal});
+    const data=await response.json().catch(()=>({error:'Ответ сервера не распознан. Запустите python server.py.'}));
+    if(!response.ok)throw new Error(data.error||`Ошибка сервера ${response.status}`);
+    return data;
+  } finally {clearTimeout(timeout);}
+}
+
+function connectionError(error){
+  serverAvailable=false;
+  $('connectionNotice').hidden=false;$('connectionNotice').classList.add('error');
+  $('connectionNotice').textContent='Нет связи с backend. Запустите .venv\\Scripts\\python.exe server.py. Повторное подключение автоматически. '+(error?.message||'');
+  $('agentStatus').textContent='Нет связи';
+  if(!clients.length)$('graphCaption').textContent='Ожидание аналитического сервера…';
+}
+
+async function loadDataset(){
+  const seq=++loadSequence;
+  const data=await api('/api/state');
+  if(seq!==loadSequence)return;
+  if(!Array.isArray(data.nodes)||!data.nodes.length)throw new Error('Сервер вернул пустой граф');
+  if(chatController)chatController.abort();
+  if(detailController)detailController.abort();detailData=null;
+  $('nodeDetails').open=false;
+  datasetVersion=data.version;datasetMeta=data.meta;serverAvailable=true;
+  clients=data.nodes.map(normalizeClient);clusters=data.clusters;topClients=data.top;
   edges=data.edges.map(e=>({...e,from:String(e.from),to:String(e.to)}));
-  try {
-    const results=await Promise.allSettled([getCSV('nodes_roles'),getCSV('clusters'),getCSV('top_nodes')]);
-    if(results[0].status==='fulfilled')clients=results[0].value.map(normalizeClient);
-    if(results[1].status==='fulfilled')clusters=results[1].value;
-    if(results[2].status==='fulfilled')topClients=results[2].value;
-    if(results.some(r=>r.status==='rejected'))showToast('Часть данных недоступна. Показан доступный граф.');
-  } catch { showToast('Показан доступный граф из локальной выгрузки.'); }
-  clients.sort((a,b)=>b.priority_score-a.priority_score||a.id.localeCompare(b.id));
+  clients.sort((a,b)=>b.priority_score-a.priority_score||(BigInt(a.id)<BigInt(b.id)?-1:BigInt(a.id)>BigInt(b.id)?1:0));
   clientMap=new Map(clients.map(c=>[c.id,c]));
   clients.forEach((c,i)=>c.rank=i+1);
-  selectedId=centerId=clients[0].id;
+  selectedId=centerId=clients[0].id;activeRole='';page=0;chatContext=selectedId;
+  $('tableSearch').value='';$('searchInput').value='';resetTransform();
   renderSummary();renderLegend();renderQueue();renderClusters();
   $('previewTable').innerHTML=tableMarkup(clients.slice(0,5));
   selectClient(selectedId);renderGraph();
-});
+  const period=datasetMeta.date_from?`${datasetMeta.date_from} — ${datasetMeta.date_to}`:'Переводов нет';
+  $('sidebarPeriod').textContent=period;$('headerPeriod').textContent=period;$('volumePeriod').textContent=period;
+  $('datasetLabel').textContent=datasetMeta.label;
+  $('datasetDetails').textContent=`${formatNumber(datasetMeta.edges)} пар · ${formatNumber(datasetMeta.transactions)} операций · глубина до ${datasetMeta.max_depth}`;
+  $('agentBrief').textContent=`${formatNumber(datasetMeta.truncated)} клиентов на границе выборки. Узнайте, кого проверить первым и почему.`;
+  document.querySelectorAll('a[download]').forEach(a=>{const url=new URL(a.href);url.searchParams.set('version',datasetVersion);a.href=url.toString();});
+  $('connectionNotice').hidden=true;$('connectionNotice').classList.remove('error');
+  clearChat();
+}
 
 function bindEvents(){
   document.querySelectorAll('[data-view]').forEach(b=>b.addEventListener('click',()=>setView(b.dataset.view)));
   $('searchForm').addEventListener('submit',e=>{e.preventDefault();findClient($('searchInput').value);});
   $('roleFilter').addEventListener('change',()=>{activeRole=$('roleFilter').value;renderGraph();renderLegendState();});
   $('legend').addEventListener('click',e=>{const b=e.target.closest('[data-role]');if(!b)return;activeRole=activeRole===b.dataset.role?'':b.dataset.role;$('roleFilter').value=activeRole;renderGraph();renderLegendState();});
-  $('resetGraph').addEventListener('click',()=>{activeRole='';$('roleFilter').value='';centerId=clients[0].id;selectClient(centerId);resetTransform();renderGraph();renderLegendState();});
+  $('resetGraph').addEventListener('click',()=>{if(!clients.length)return;activeRole='';$('roleFilter').value='';centerId=clients[0].id;selectClient(centerId);resetTransform();renderGraph();renderLegendState();});
   $('showConnections').addEventListener('click',()=>{centerId=selectedId;activeRole='';$('roleFilter').value='';resetTransform();renderGraph();renderLegendState();});
   $('copyId').addEventListener('click',async()=>{try{await navigator.clipboard.writeText(selectedId);showToast('GID скопирован');}catch{showToast('Выделите GID в карточке и скопируйте его.');}});
   $('zoomIn').addEventListener('click',()=>setZoom(zoom*1.25));
@@ -139,13 +176,19 @@ function renderLegendState(){document.querySelectorAll('[data-role]').forEach(b=
 
 function setView(view){
   currentView=view;
-  ['graph','queue','clusters'].forEach(v=>{$(v+'View').hidden=v!==view;});
+  document.querySelector('main').classList.toggle('assistant-open',view==='assistant');
+  $('pageTitle').textContent=view==='assistant'?'Ассистент исследования':'Увидеть связи. Понять структуру.';
+  $('pageDescription').textContent=view==='assistant'?'Задайте вопрос — получите расчёт, основание и переход к клиенту.':'Исследуйте потоки. Проверяйте гипотезы. Объясняйте решения.';
+  ['graph','queue','clusters','assistant'].forEach(v=>{$(v+'View').hidden=v!==view;});
   document.querySelectorAll('[data-view]').forEach(b=>{b.classList.toggle('active',b.dataset.view===view);if(b.getAttribute('role')==='tab')b.setAttribute('aria-selected',String(b.dataset.view===view));});
-  $('breadcrumbTitle').textContent={graph:'Граф денег',queue:'Клиенты',clusters:'Кластеры'}[view];
+  $('breadcrumbTitle').textContent={graph:'Граф денег',queue:'Клиенты',clusters:'Кластеры',assistant:'AI-ассистент'}[view];
 }
 
 function selectClient(id){
-  const c=clientMap.get(id);if(!c)return;selectedId=id;
+  const c=clientMap.get(id);if(!c)return;
+  if(selectedId!==id){if(detailController)detailController.abort();detailData=null;$('nodeDetails').open=false;}
+  selectedId=id;
+  chatContext=id;updateChatContext();
   const meta=ROLES[c.role]||ROLES.peripheral;
   $('clientShort').textContent='Клиент '+shortId(id);
   $('clientId').textContent=id;
@@ -159,6 +202,8 @@ function selectClient(id){
   $('clientDepth').textContent=c.is_seed?'Seed · 0':c.depth+' колено';
   $('evidence').textContent=c.evidence||'Описание недоступно';
   $('boundaryNote').hidden=!c.truncated;
+  $('boundaryNote').textContent='Граница глубины 4: исходящие неизвестны. Терминальность не подтверждена.';
+  if(c.is_seed){$('boundaryNote').hidden=false;$('boundaryNote').textContent='Seed: входящие извне выборки отсутствуют. Отношение исходящих к входящим не доказывает аномалию.';}
   document.querySelectorAll('.graph-node').forEach(g=>{const circle=g.querySelector('.node-circle');circle.style.stroke=g.dataset.id===id?'#425f35':'#fff';});
 }
 
@@ -175,7 +220,7 @@ function renderGraph(){
   const connected=edges.filter(e=>e.from===centerId||e.to===centerId);
   const weights=new Map();
   connected.forEach(e=>{const id=e.from===centerId?e.to:e.from;weights.set(id,(weights.get(id)||0)+Number(e.sum_kzt));});
-  let direct=[...weights.keys()].filter(id=>clientMap.has(id));
+  let direct=[...weights.keys()].filter(id=>id!==centerId&&clientMap.has(id));
   if(activeRole)direct=direct.filter(id=>clientMap.get(id).role===activeRole);
   direct.sort((a,b)=>(weights.get(b)-weights.get(a))||a.localeCompare(b));
   const primary=direct.slice(0,24);
@@ -188,13 +233,13 @@ function renderGraph(){
   primary.forEach((id,i)=>{const angle=-Math.PI/2+(i/Math.max(primary.length,1))*Math.PI*2;const wobble=(i%3-1)*16;positions.set(id,{x:450+Math.cos(angle)*(222+wobble),y:285+Math.sin(angle)*(172+wobble*.5),r:10+clientMap.get(id).priority_score*5});});
   extras.forEach((id,i)=>{const angle=-Math.PI/2+((i+.35)/Math.max(extras.length,1))*Math.PI*2;positions.set(id,{x:450+Math.cos(angle)*355,y:285+Math.sin(angle)*247,r:6+clientMap.get(id).priority_score*3});});
   const visibleEdges=edges.filter(e=>positions.has(e.from)&&positions.has(e.to));
-  $('graphEdges').innerHTML=visibleEdges.map(e=>{const a=positions.get(e.from),b=positions.get(e.to);const main=e.from===centerId||e.to===centerId;const mx=(a.x+b.x)/2+(b.y-a.y)*.045,my=(a.y+b.y)/2-(b.x-a.x)*.045;return `<path class="graph-edge ${main?'major':''}" d="M${a.x},${a.y} Q${mx},${my} ${b.x},${b.y}" marker-end="url(#arrow)"><title>${escapeHtml(e.from)} → ${escapeHtml(e.to)} · ${formatMoney(Number(e.sum_kzt))} · ${e.n_tx} операций</title></path>`;}).join('');
+  $('graphEdges').innerHTML=visibleEdges.map(e=>{const a=positions.get(e.from),b=positions.get(e.to);const main=e.from===centerId||e.to===centerId;const mx=(a.x+b.x)/2+(b.y-a.y)*.045,my=(a.y+b.y)/2-(b.x-a.x)*.045;const path=e.from===e.to?`M${a.x-8},${a.y} C${a.x-70},${a.y-85} ${a.x+70},${a.y-85} ${a.x+8},${a.y}`:`M${a.x},${a.y} Q${mx},${my} ${b.x},${b.y}`;return `<path class="graph-edge ${main?'major':''}" d="${path}" marker-end="url(#arrow)"><title>${escapeHtml(e.from)} → ${escapeHtml(e.to)} · ${formatMoney(Number(e.sum_kzt))} · ${e.n_tx} операций</title></path>`;}).join('');
   $('graphNodes').innerHTML=[...positions].map(([id,p])=>{
     const c=clientMap.get(id),m=ROLES[c.role]||ROLES.peripheral,isCenter=id===centerId,major=primarySet.has(id),showLabel=isCenter||(major&&primary.indexOf(id)%2===0);
     return `<g class="graph-node" data-id="${id}" role="button" tabindex="0" aria-label="Клиент ${id}, ${m.label}" transform="translate(${p.x},${p.y})"><title>${id}\n${m.label}\n${formatMoney(c.out_kzt)} отправлено</title>${isCenter?'<circle class="center-pulse" r="45"/>':''}<circle class="node-halo" r="${p.r+(isCenter?11:5)}" fill="${m.color}"/><circle class="node-circle" r="${p.r}" fill="${m.color}"/>${isCenter?`<text class="node-initials" text-anchor="middle" dominant-baseline="central" style="font-size:17px!important">${m.initial}</text>`:''}${showLabel?`<text class="${isCenter?'center-label':''}" text-anchor="middle" y="${p.r+17}">${isCenter?'GID ':''}${shortId(id)}</text>`:''}${isCenter?`<text text-anchor="middle" y="${p.r+33}" style="font-size:9px">${m.label}</text>`:''}</g>`;
   }).join('');
   $('graphNodes').querySelectorAll('.graph-node').forEach(g=>{g.addEventListener('click',()=>selectClient(g.dataset.id));g.addEventListener('keydown',e=>{if(e.key==='Enter'||e.key===' '){e.preventDefault();selectClient(g.dataset.id);}});});
-  $('graphCaption').textContent=connected.length?`Фрагмент сети · узлов: ${positions.size} · связей: ${visibleEdges.length}`:'Связи клиента отсутствуют в визуальной выгрузке';
+  $('graphCaption').textContent=connected.length?`Фрагмент · ${positions.size} узлов · ${visibleEdges.length} связей. Прямых контрагентов показано ${primary.length} из ${direct.length}`:'У клиента нет переводов в наблюдаемом графе';
   $('network').setAttribute('role','group');
   $('network').setAttribute('aria-label',`Граф клиента ${centerId}: ${positions.size} узлов, ${visibleEdges.length} рёбер. Показана часть связей.`);
   selectClient(selectedId);
@@ -218,3 +263,141 @@ function renderClusters(){
   $('clusterGrid').innerHTML=clusters.map(c=>`<article class="cluster-card"><div class="cluster-card-head">Кластер #${String(c.cluster_id).padStart(2,'0')}<span>${icon('layers')}</span></div><p>${escapeHtml(c.hypothesis)}</p><div class="cluster-stats"><span>Клиентов <strong>${formatNumber(Number(c.n_nodes))}</strong></span><span>Seed <strong>${c.n_seed}</strong></span></div><div class="cluster-stats"><span>Внутренний оборот</span><strong>${formatMoney(Number(c.sum_kzt_internal))}</strong></div><button class="text-button" data-client="${escapeHtml(c.top_gids.split(';')[0])}">Открыть лидера ${icon('arrowright')}</button></article>`).join('')||'<div class="table-empty">Данные кластеров недоступны.</div>';
 }
 function showToast(message){clearTimeout(toastTimer);$('toast').textContent=message;$('toast').classList.add('visible');toastTimer=setTimeout(()=>$('toast').classList.remove('visible'),3500);}
+
+function bindWorkspace(){
+  $('nodeDetails').addEventListener('toggle',()=>{if($('nodeDetails').open)loadNodeDetails();});
+  $('detailPrevious').addEventListener('click',()=>{detailPage=Math.max(0,detailPage-1);renderNodeDetails();});
+  $('detailNext').addEventListener('click',()=>{detailPage++;renderNodeDetails();});
+  document.querySelectorAll('[data-upload]').forEach(b=>b.addEventListener('click',()=>{$('uploadDialog').showModal();}));
+  $('closeUpload').addEventListener('click',()=>$('uploadDialog').close());
+  $('uploadForm').addEventListener('submit',uploadDataset);
+  $('resetDemo').addEventListener('click',async()=>{
+    $('resetDemo').disabled=true;
+    try{await api('/api/demo',{body:{}});await loadDataset();$('uploadStatus').textContent='Исходный датасет восстановлен.';$('uploadStatus').classList.remove('error');}
+    catch(e){$('uploadStatus').textContent=e.message;$('uploadStatus').classList.add('error');}
+    finally{$('resetDemo').disabled=false;}
+  });
+  const ask=document.createElement('button');ask.className='button ask-client';ask.textContent='Разобрать с ассистентом';
+  ask.addEventListener('click',()=>{chatContext=selectedId;updateChatContext();setView('assistant');sendQuestion('Почему выбранный клиент в приоритете?');});
+  document.querySelector('.inspector').append(ask);
+  $('chatForm').addEventListener('submit',e=>{e.preventDefault();sendQuestion($('chatInput').value);});
+  $('chatInput').addEventListener('keydown',e=>{if(e.key==='Enter'&&!e.shiftKey&&!e.isComposing){e.preventDefault();sendQuestion($('chatInput').value);}});
+  document.querySelectorAll('[data-prompt]').forEach(b=>b.addEventListener('click',()=>sendQuestion(b.dataset.prompt)));
+  $('clearChat').addEventListener('click',clearChat);
+  $('clearContext').addEventListener('click',()=>{chatContext=null;updateChatContext();});
+}
+
+async function loadNodeDetails(){
+  if(!selectedId)return;
+  const id=selectedId,version=datasetVersion;
+  if(detailData?.client.gid===id){renderNodeDetails();return;}
+  if(detailController)detailController.abort();
+  const controller=new AbortController();detailController=controller;
+  $('detailSummary').textContent='Загрузка всех контрагентов и дневных потоков…';
+  $('detailTable').replaceChildren();$('dailyTable').replaceChildren();
+  try{
+    const data=await api(`/api/node/${encodeURIComponent(id)}?version=${encodeURIComponent(version)}`,{controller});
+    if(id!==selectedId||version!==datasetVersion)return;
+    detailData=data;detailPage=0;renderNodeDetails();
+  }catch(e){if(id===selectedId&&version===datasetVersion)$('detailSummary').textContent=e.name==='AbortError'?'Загрузка отменена. Закройте и откройте раздел, чтобы повторить.':e.message;}
+}
+function renderNodeDetails(){
+  if(!detailData)return;
+  const rows=detailData.neighbors, pages=Math.max(1,Math.ceil(rows.length/25));detailPage=Math.min(detailPage,pages-1);
+  $('detailSummary').textContent=`GID ${detailData.client.gid} · ${rows.length} направленных пар · сортировка по сумме. Здесь доступны все наблюдаемые прямые связи, не только фрагмент карты.`;
+  $('detailTable').innerHTML=`<table><thead><tr><th>Отправитель</th><th>Получатель</th><th>Сумма</th><th>Операций</th></tr></thead><tbody>${rows.slice(detailPage*25,(detailPage+1)*25).map(e=>`<tr><td><button class="client-link" data-client="${escapeHtml(e.from)}">${escapeHtml(e.from)}</button></td><td><button class="client-link" data-client="${escapeHtml(e.to)}">${escapeHtml(e.to)}</button></td><td>${Number(e.sum_kzt).toLocaleString('ru-RU',{minimumFractionDigits:2,maximumFractionDigits:2})} ₸</td><td>${e.n_tx}</td></tr>`).join('')||'<tr><td colspan="4">Нет наблюдаемых переводов.</td></tr>'}</tbody></table>`;
+  $('detailPageLabel').textContent=`${detailPage+1} / ${pages}`;$('detailPrevious').disabled=detailPage===0;$('detailNext').disabled=detailPage===pages-1;
+  $('dailyTable').innerHTML=`<table><thead><tr><th>Дата</th><th>Вход</th><th>Выход</th><th>Операций</th></tr></thead><tbody>${detailData.daily.map(day=>`<tr><td>${escapeHtml(day.date)}</td><td>${formatMoney(day.incoming)}</td><td>${formatMoney(day.outgoing)}</td><td>${day.n_tx}</td></tr>`).join('')||'<tr><td colspan="4">Активных дней нет.</td></tr>'}</tbody></table>`;
+}
+
+function updateChatContext(){$('chatContext').textContent=chatContext?`GID ${chatContext}`:'Весь датасет';}
+function clearChat(){
+  if(chatController)chatController.abort();
+  chatBusy=false;$('sendChat').disabled=false;$('chatInput').value='';
+  $('chatMessages').replaceChildren();
+  if(!datasetVersion)return;
+  const entry=document.createElement('div');entry.className='chat-empty';
+  entry.innerHTML=`<span class="chat-author">Автоматическая сводка · локальные расчёты</span><h3>Сеть готова к исследованию</h3><p>${formatNumber(datasetMeta.nodes)} клиентов · ${formatNumber(datasetMeta.transactions)} операций · ${formatMoney(datasetMeta.volume_kzt)}. ${formatNumber(datasetMeta.truncated)} клиентов на границе глубины 4: их исходящие неизвестны.</p><p>Первым в рейтинге стоит <button class="client-link" data-client="${escapeHtml(clients[0].id)}">GID ${escapeHtml(clients[0].id)} ↗</button>. ${escapeHtml(clients[0].evidence)}</p><p>Это основание начать проверку, не вывод о нарушении. Выберите сценарий или задайте свой вопрос.</p>`;
+  const prompts=document.createElement('div');prompts.className='quick-prompts';
+  ['Кого проверить первым?','Разбор выбранного клиента','Ограничения анализа'].forEach(question=>{const b=document.createElement('button');b.className='button';b.textContent=question;b.addEventListener('click',()=>sendQuestion(question));prompts.append(b);});
+  entry.append(prompts);
+  $('chatMessages').append(entry);updateChatContext();
+}
+
+function addChatEntry(author,text){
+  $('chatMessages').querySelector('.chat-empty')?.remove();
+  const entry=document.createElement('article');entry.className=`chat-entry ${author==='Вы'?'user':'assistant'}`;
+  const heading=document.createElement('div');heading.className='chat-author';heading.textContent=author;
+  const body=document.createElement('div');body.className='chat-body';body.textContent=text;
+  entry.append(heading,body);$('chatMessages').append(entry);scrollChat();return entry;
+}
+function scrollChat(){$('chatMessages').scrollTop=$('chatMessages').scrollHeight;}
+
+async function sendQuestion(question){
+  question=question.trim();if(!question||chatBusy)return;
+  if(!datasetVersion||!serverAvailable){showToast('Дождитесь подключения к серверу.');return;}
+  if(question.length>2000){showToast('Вопрос должен быть не длиннее 2000 символов.');return;}
+  const version=datasetVersion,context=chatContext;
+  const controller=new AbortController();chatController=controller;chatBusy=true;$('sendChat').disabled=true;$('chatInput').value='';
+  addChatEntry('Вы',question+(context?`\nКонтекст: GID ${context}`:''));
+  const entry=addChatEntry('Ассистент','Проверяю наблюдаемые связи и расчёты…');entry.classList.add('loading-reply');
+  try{
+    const result=await api('/api/chat',{body:{message:question,selected_gid:context,version},controller,timeout:35000});
+    if(datasetVersion!==version||!entry.isConnected)return;
+    entry.classList.remove('loading-reply');entry.querySelector('.chat-author').textContent=result.mode==='openai'?'OpenAI · проверенные расчёты':'Локальный разбор · без LLM';
+    entry.querySelector('.chat-body').textContent=result.answer;
+    if(result.warning){const warning=document.createElement('div');warning.className='chat-warning';warning.textContent=result.warning;entry.append(warning);}
+    if(result.tool){const tool=document.createElement('div');tool.className='chat-tool';tool.textContent=`Запрос к графу: ${result.tool} · версия ${version.slice(0,8)} · суммы из данных`;entry.append(tool);}
+    if(result.facts?.length){
+      const cards=document.createElement('div');cards.className='fact-cards';
+      cards.innerHTML=result.facts.map(c=>`<div class="fact-card"><div class="fact-card-head"><button class="client-link" data-client="${escapeHtml(c.gid)}">GID ${escapeHtml(c.gid)} ↗</button><span>${escapeHtml((ROLES[c.role]||ROLES.peripheral).label)} · ${(c.priority_score*100).toFixed(1)}/100</span></div><div class="fact-metrics"><span>Вход ${formatMoney(c.in_kzt)} · ${c.in_tx} операций</span><span>Выход ${formatMoney(c.out_kzt)} · ${c.out_tx} операций</span></div><p>${escapeHtml(c.evidence)}</p></div>`).join('');
+      entry.append(cards);
+    }else if(result.references?.length){
+      const refs=document.createElement('div');refs.className='chat-refs';refs.innerHTML=result.references.map(id=>`<button class="button" data-client="${escapeHtml(id)}">Открыть ${escapeHtml(id)} ↗</button>`).join('');entry.append(refs);
+    }
+  }catch(error){if(entry.isConnected){entry.classList.remove('loading-reply');entry.querySelector('.chat-body').textContent=error.name==='AbortError'?'Запрос отменён или превышено время ожидания. Попробуйте ещё раз.':`Не удалось получить ответ: ${error.message}`;}}
+  finally{if(chatController===controller){chatBusy=false;chatController=null;$('sendChat').disabled=false;}scrollChat();}
+}
+
+async function fileBase64(file){
+  const bytes=new Uint8Array(await file.arrayBuffer());let binary='';
+  for(let i=0;i<bytes.length;i+=32768)binary+=String.fromCharCode(...bytes.subarray(i,i+32768));
+  return btoa(binary);
+}
+async function uploadDataset(event){
+  event.preventDefault();if(importPending)return;
+  const choices=[['nodes.parquet','fileNodes'],['edges.parquet','fileEdges'],['transactions.parquet','fileTransactions']];
+  const files=choices.map(([name,id])=>[name,$(id).files[0]]);
+  if(files.some(([,file])=>!file)){showToast('Выберите все три файла');return;}
+  if(files.reduce((sum,[,file])=>sum+file.size,0)>25*1024*1024){$('uploadStatus').textContent='Файлы превышают общий лимит 25 МБ';$('uploadStatus').classList.add('error');return;}
+  importPending=true;setImportControls(true);$('uploadStatus').classList.remove('error');$('uploadStatus').textContent='Передаём файлы на локальный сервер…';
+  try{
+    const encoded=Object.fromEntries(await Promise.all(files.map(async([name,file])=>[name,await fileBase64(file)])));
+    await api('/api/import',{body:{files:encoded},timeout:30000});
+    await pollStatus();
+  }catch(error){importPending=false;setImportControls(false);$('uploadStatus').textContent='Не удалось начать импорт: '+error.message;$('uploadStatus').classList.add('error');}
+}
+function setImportControls(busy){
+  $('startImport').disabled=busy;$('resetDemo').disabled=busy;
+  ['fileNodes','fileEdges','fileTransactions'].forEach(id=>$(id).disabled=busy);
+  $('uploadProgress').hidden=!busy;
+}
+
+async function pollStatus(){
+  if(polling)return;polling=true;
+  try{
+    const status=await api('/api/status');serverAvailable=true;
+    if(status.version!==datasetVersion)await loadDataset();
+    $('connectionNotice').hidden=true;
+    $('agentStatus').textContent=status.agent.configured?'OpenAI · настроен':'Локальный режим';
+    $('agentModeDescription').textContent=status.agent.configured?`OpenAI (${status.agent.model}) выбирает запрос к графу. Ответы строятся из проверенных расчётов; при ошибке API включается локальный режим.`:'Сейчас доступен локальный разбор по сценариям — это не языковая модель. Для OpenAI задайте OPENAI_API_KEY на сервере и перезапустите его.';
+    const job=status.job;importPending=job.state==='running';setImportControls(importPending);
+    if(job.state!=='idle'){
+      $('uploadStatus').textContent=job.stage+(job.state==='failed'?'\nТекущий датасет не изменён. Исправьте файлы и повторите загрузку.':'');
+      $('uploadStatus').classList.toggle('error',job.state==='failed');$('uploadProgress').value=job.progress;
+    }
+    if(importPending){$('connectionNotice').hidden=false;$('connectionNotice').classList.remove('error');$('connectionNotice').textContent='Обрабатываем новый датасет. Текущая сеть остаётся доступна. '+job.stage;}
+    else if(status.notice){$('connectionNotice').hidden=false;$('connectionNotice').classList.add('error');$('connectionNotice').textContent=status.notice;}
+  }catch(error){connectionError(error);}
+  finally{polling=false;}
+}
