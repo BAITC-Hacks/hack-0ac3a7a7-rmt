@@ -46,9 +46,9 @@ def sanity_check(edges, nodes, tx):
     graph_nodes = set(edges.src) | set(edges.dst)
     assert graph_nodes <= set(nodes.gid), "В edges присутствуют неизвестные gid"
     orphans = set(nodes.gid) - graph_nodes
-    print(f"Данные: {len(nodes):,} узлов, {len(edges):,} рёбер, {len(tx):,} транзакций, "
+    print(f"Data: {len(nodes):,} nodes, {len(edges):,} edges, {len(tx):,} transactions, "
           f"{edges.sum_kzt.sum():,.2f} KZT")
-    print(f"Период: {tx.date.min().date()} — {tx.date.max().date()}; изолированных узлов: {len(orphans)}")
+    print(f"Period: {tx.date.min().date()} - {tx.date.max().date()}; isolated nodes: {len(orphans)}")
 
 
 def build_graph(edges, nodes):
@@ -264,23 +264,25 @@ def evidence_for(row):
     if row.in_deg == 0 and row.out_deg == 0:
         return "Изолированный seed: 0 входящих и 0 исходящих рёбер в наблюдаемом графе."
     if row.role == "consolidator":
-        text = (f"Сбор: {row.in_deg} плательщ., {row.in_tx} tx, {money(row.in_kzt)} KZT; "
+        text = (f"Признаки сбора: {row.in_deg} плательщ., {row.in_tx} tx, {money(row.in_kzt)} KZT; "
                 f"выход: {row.out_deg} получ., {money(row.out_kzt)} KZT; seed-ветвей {row.upstream_seed_count}.")
     elif row.role == "distributor":
-        text = (f"Распределение: {row.out_deg} получ., {row.out_tx} tx, {money(row.out_kzt)} KZT; "
+        text = (f"Признаки распределения: {row.out_deg} получ., {row.out_tx} tx, {money(row.out_kzt)} KZT; "
                 f"вход: {row.in_deg} плательщ., {money(row.in_kzt)} KZT.")
     elif row.role == "transit":
-        text = (f"Транзит: вход {money(row.in_kzt)}, выход {money(row.out_kzt)} KZT; "
+        text = (f"Признаки транзита: вход {money(row.in_kzt)}, выход {money(row.out_kzt)} KZT; "
                 f"совпадение в тот же день {row.same_day_ratio:.0%}, двусторонних дней {int(row.both_direction_days)}.")
     elif row.role == "coordinator":
-        text = (f"Связующий узел: seed-ветвей {row.upstream_seed_count}, соседних кластеров {row.cross_cluster_count}; "
+        text = (f"Связующий профиль: seed-ветвей {row.upstream_seed_count}, соседних кластеров {row.cross_cluster_count}; "
                 f"in/out degree {row.in_deg}/{row.out_deg}, bridge pctl {row.betweenness_pct:.0%}.")
     elif row.role == "terminal":
         note = "обрезан на depth=4; терминальность вероятностная" if row.truncated_by_depth else "исходящих рёбер 0"
-        text = f"Получатель: {row.in_deg} плательщ., {row.in_tx} tx, {money(row.in_kzt)} KZT; {note}."
+        text = f"Получатель-кандидат: {row.in_deg} плательщ., {row.in_tx} tx, {money(row.in_kzt)} KZT; {note}."
     else:
         note = "depth=4, исходящие неизвестны" if row.truncated_by_depth else "выраженной структурной роли нет"
-        text = f"Периферия: in/out degree {row.in_deg}/{row.out_deg}, оборот {money(row.in_kzt+row.out_kzt)} KZT; {note}."
+        text = f"Периферийный профиль: in/out degree {row.in_deg}/{row.out_deg}, оборот {money(row.in_kzt+row.out_kzt)} KZT; {note}."
+    if row.truncated_by_depth and row.role not in {"terminal", "peripheral"}:
+        text += " depth=4: исходящие неизвестны."
     return text[:200]
 
 
@@ -310,10 +312,10 @@ def export_clusters(frame, edges):
 
 def export_graph_data(frame, edges, path, limit):
     ranked = frame.sort_values(["priority_score", "gid"], ascending=[False, True])
-    anchors = set(int(gid) for gid in ranked.head(60).gid)
-    near = edges[edges.src.isin(anchors) | edges.dst.isin(anchors)]
-    candidates = anchors | set(map(int, near.src)) | set(map(int, near.dst))
-    selected = ranked[ranked.gid.isin(candidates)].head(limit)
+    # Keep every node and edge available to the UI so an arbitrary GID named by
+    # the jury can be opened with its links. The browser renders only a small
+    # ego-network at a time, so the complete payload remains responsive.
+    selected = ranked if limit <= 0 else ranked.head(limit)
     selected_ids = set(map(int, selected.gid))
     selected_edges = edges[edges.src.isin(selected_ids) & edges.dst.isin(selected_ids)]
     colors = {"consolidator": "#ef4444", "transit": "#f59e0b", "distributor": "#3b82f6",
@@ -359,9 +361,9 @@ def write_outputs(frame, edges, out_dir, top_count, ui_limit):
     top_export.to_csv(out_dir/"top_nodes.csv", index=False, encoding="utf-8-sig")
     export_graph_data(frame, edges, out_dir/"graph_data.js", ui_limit)
     counts = frame.role.value_counts().reindex(ROLES, fill_value=0)
-    print("Роли:", ", ".join(f"{r}={c}" for r, c in counts.items()))
-    print(f"Кластеры: {len(clusters)}; top_nodes: {len(top_export)}")
-    print(f"Результаты записаны в {out_dir.resolve()}")
+    print("Roles:", ", ".join(f"{r}={c}" for r, c in counts.items()))
+    print(f"Clusters: {len(clusters)}; top_nodes: {len(top_export)}")
+    print(f"Outputs written to {out_dir.resolve()}")
 
 
 def main():
@@ -369,7 +371,8 @@ def main():
     parser.add_argument("--data", default="./data")
     parser.add_argument("--out", default="./out")
     parser.add_argument("--top", type=int, default=30)
-    parser.add_argument("--ui-limit", type=int, default=500)
+    parser.add_argument("--ui-limit", type=int, default=0,
+                        help="0 = все узлы доступны в UI (рекомендуется)")
     args = parser.parse_args()
     edges, nodes, tx = load(Path(args.data))
     sanity_check(edges, nodes, tx)
