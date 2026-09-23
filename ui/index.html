@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Freedom AML — Граф денег</title>
+  <script src="https://unpkg.com/vis-network/standalone/umd/vis-network.min.js"></script>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand"><span class="brand-mark">F</span><div>Freedom AML<small>Граф финансовой структуры</small></div></div>
+    <div class="search">
+      <input id="searchInput" type="text" inputmode="numeric" placeholder="Введите полный GID">
+      <button id="searchButton">Найти</button>
+    </div>
+    <div class="status"><span class="pulse"></span> Анализ готов</div>
+  </header>
+
+  <main class="layout">
+    <aside class="control-panel">
+      <section>
+        <div class="eyebrow">Обзор выборки</div>
+        <div class="metrics">
+          <div><strong id="totalNodes">—</strong><span>узлов всего</span></div>
+          <div><strong id="shownNodes">—</strong><span>в визуализации</span></div>
+          <div><strong id="shownEdges">—</strong><span>связей показано</span></div>
+        </div>
+      </section>
+
+      <section>
+        <div class="section-title"><span>Роли</span><button id="resetFilter" class="link-button">Сбросить</button></div>
+        <div id="legend" class="legend"></div>
+      </section>
+
+      <section class="top-section">
+        <div class="section-title"><span>Проверить первыми</span><span class="hint">TOP 10</span></div>
+        <div id="topList" class="top-list"></div>
+      </section>
+    </aside>
+
+    <section class="graph-area">
+      <div id="network-container"></div>
+      <div class="graph-note">Размер узла = приоритет · стрелка = направление денег</div>
+      <button id="fitButton" class="fit-button" title="Показать весь граф">⌖</button>
+    </section>
+
+    <aside id="side-panel" class="details hidden">
+      <div class="details-head">
+        <div><div class="eyebrow">Досье клиента</div><h2 id="node-gid">—</h2></div>
+        <button id="closePanel" class="close-button">×</button>
+      </div>
+      <div class="details-body">
+        <div class="role-row"><span id="node-role" class="badge">—</span><span id="node-flags" class="flags"></span></div>
+        <div class="score-card">
+          <div><span>Приоритет проверки</span><strong id="node-score">—</strong></div>
+          <div class="score-track"><i id="scoreBar"></i></div>
+        </div>
+        <div class="detail-grid">
+          <div><span>Входящий поток</span><strong id="node-in">—</strong><small id="node-in-degree">—</small></div>
+          <div><span>Исходящий поток</span><strong id="node-out">—</strong><small id="node-out-degree">—</small></div>
+          <div><span>Кластер</span><strong id="node-cluster">—</strong></div>
+          <div><span>Глубина</span><strong id="node-depth">—</strong></div>
+        </div>
+        <div class="evidence"><span>Почему назначена роль</span><p id="node-evidence">—</p></div>
+        <div class="warning" id="truncatedWarning">Исходящие операции неизвестны: узел находится на границе четырёх колен.</div>
+      </div>
+    </aside>
+  </main>
+
+  <script src="../out/graph_data.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>

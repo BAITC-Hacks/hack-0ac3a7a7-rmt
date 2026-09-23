@@ -1,0 +1,21 @@
+/твой_проект
+│
+├── README.md                 # Описание и инструкция для жюри (1 команда для запуска)
+├── requirements.txt          # Зависимости (pandas, networkx, openai и т.д.)
+├── starter.py                # ЕДИНСТВЕННЫЙ Python-скрипт (вся бэкенд-логика)
+│
+├── /data                     # Папка с исходными датасетами организаторов
+│   ├── edges.parquet
+│   ├── nodes.parquet
+│   └── transactions.parquet
+│
+├── /out                      # Сюда starter.py будет сохранять результаты
+│   ├── nodes_roles.csv       # Файл по ТЗ
+│   ├── clusters.csv          # Файл по ТЗ
+│   ├── top_nodes.csv         # Файл по ТЗ
+│   └── graph_data.js         # ЧИТ-КОД: Python генерирует этот файл для фронтенда
+│
+└── /ui                       # Папка с визуализацией (Фронтенд)
+    ├── index.html            # Каркас страницы
+    ├── style.css             # Стили (твой Glassmorphism и темная тема)
+    └── app.js                # Логика отрисовки графа (Vis.js) и карточек
